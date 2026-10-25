@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+from ..capabilities import ARM_POSES
 from .base import ActionResult, RobotAdapter
 
 
@@ -25,6 +26,7 @@ class MockRobot(RobotAdapter):
         self.at_zone = self.arena.get("start_zone", "home")
         self.holding: str | None = None
         self.gripper_open = True
+        self.arm_pose = "home"
         self.stopped = False
         self.faults: dict[str, tuple[str, str]] = {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -92,6 +94,12 @@ class MockRobot(RobotAdapter):
         if op == "gripper_close":
             self.gripper_open = False
             return ActionResult("done", "gripper closed")
+        if op == "arm_pose":
+            pose = args.get("pose")
+            if pose not in ARM_POSES:   # like the robot server: only saved poses
+                return ActionResult("failed", f"no arm pose called {pose}")
+            self.arm_pose = pose
+            return ActionResult("done", f"arm at {pose}")
         if op in ("drive_bounded", "turn_bounded"):
             return ActionResult("done", f"{op} {args}")
         if op in ("speak", "ask", "remember", "schedule"):
@@ -110,6 +118,7 @@ class MockRobot(RobotAdapter):
             "at_zone": self.at_zone,
             "holding": self.holding,
             "gripper_open": self.gripper_open,
+            "arm_pose": self.arm_pose,
             "stopped": self.stopped,
             "objects": dict(sorted(self.positions.items())),
         }

@@ -15,7 +15,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .checker import check_plan
 from .db import now
@@ -40,6 +40,8 @@ APPROVAL_TTL_S = 120.0
 # stop. The same pattern as STOP_WORDS in console/server/parser.py (tests/test_spoken_stop.py checks it).
 STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa|wait|pause|hold\s+on|hold\s+it|hang\s+on)\b",
                         re.IGNORECASE)
+# request -> its fixed steps, a reason to refuse it, or None when the parser does not know it
+RequestParser = Callable[[str], "list[dict[str, Any]] | str | None"]
 
 
 class EngineError(Exception):
@@ -62,6 +64,8 @@ class Engine:
         self.model_hashes_at_start = hash_models(models_dir)
         # Canonical request text (normalized) -> fixed steps. See register_fixed_request().
         self.fixed_requests: dict[str, list[dict[str, Any]]] = {}
+        # Families of fixed requests ("Move forward 30 centimeters"). See register_request_parser().
+        self.request_parsers: list[RequestParser] = []
 
     # ---- setup -----------------------------------------------------------
 
@@ -79,10 +83,41 @@ class Engine:
         """
         self.fixed_requests[normalize(request)] = copy.deepcopy(steps)
 
+    def register_request_parser(self, parse: RequestParser) -> None:
+        """Plan every request parse() recognizes as the steps it returns, without a planner.
+
+        For a family of wordings that register_fixed_request cannot list one by one, such as
+        "Turn left 90 degrees". parse(request) returns the steps, a reason to refuse a request it
+        recognizes but will not plan (a distance past a bound), or None for any other request.
+        Exact fixed requests are looked up first. The rest is as for register_fixed_request:
+        propose() still refuses negated or future wording, the checker must accept the steps, and a
+        person must approve the plan's digest before anything runs.
+        """
+        if parse not in self.request_parsers:
+            self.request_parsers.append(parse)
+
+    def _fixed_steps(self, request: str) -> list[dict[str, Any]] | str | None:
+        """This request's fixed steps, a reason to refuse it, or None when it is not a fixed request."""
+        steps = self.fixed_requests.get(normalize(request))
+        if steps is not None:
+            return steps
+        for parse in self.request_parsers:
+            out = parse(request)
+            if out is not None:
+                return out
+        return None
+
     def load_arena(self, arena: dict[str, Any]) -> None:
-        """Bind tagged objects from the arena file. Locations come only from observations."""
+        """Bind tagged objects from the arena file. Locations come only from observations.
+
+        Other names come from the same file: an object's "aliases" ("pills") and "zone_aliases"
+        ({"patient": ["me", ...]}), so "Bring me my pills" finds the pill bottle and the patient.
+        """
         for o in arena["objects"]:
             self.memory.bind_object(o["id"], o["name"], o["tag"], o.get("graspable", True), o.get("width_mm"))
+            self.memory.object_aliases[o["id"]] = tuple(a.lower() for a in o.get("aliases", ()))
+        for zone, names in arena.get("zone_aliases", {}).items():
+            self.memory.zone_aliases.update({a.lower(): zone for a in names})
 
     def overhead_scan(self) -> int:
         """What the overhead camera would report. With the mock robot we ask it for visible tags."""
@@ -139,10 +174,12 @@ class Engine:
 
         bundle = self.memory.retrieve_memory_bundle(request, self.skills.approved_names())
         targets = targets_in(request, self.memory)
-        zone = find_zone(request, self.zones)
-        fixed = self.fixed_requests.get(normalize(request))
+        zone = find_zone(request, self.zones, self.memory.zone_aliases)
+        fixed = self._fixed_steps(request)
         skill = self.skills.find(targets, zone) if targets and fixed is None else None
-        if fixed is not None:
+        if isinstance(fixed, str):   # a fixed request it recognized but will not plan, e.g. past a bound
+            res = PlanResult(None, refused=fixed)
+        elif fixed is not None:
             plan = {"goal": request, "steps": copy.deepcopy(fixed), "evidence": [], "rules_used": []}
             res = PlanResult(plan, planner_calls=0, source="fixed", targets=targets, zone=None)
         elif skill:

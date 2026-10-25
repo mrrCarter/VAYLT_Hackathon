@@ -7,6 +7,7 @@ arguments and, for motion, a hard bound.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,6 +16,13 @@ MAX_DRIVE_M = 0.5
 MAX_TURN_DEG = 180.0
 MAX_TEXT = 280
 MAX_STEPS = 20
+
+# Saved arm poses a plan may name: the robot server's own names (saved on the robot with its
+# tools/arm_pose.py; its pick lowers the arm to "reach", closes the claw, then lifts to "carry").
+# "Pick it up" and "Put it down" use these two; ENGRAM_REACH_POSE / ENGRAM_CARRY_POSE rename them.
+REACH_POSE = os.environ.get("ENGRAM_REACH_POSE", "").strip() or "reach"
+CARRY_POSE = os.environ.get("ENGRAM_CARRY_POSE", "").strip() or "carry"
+ARM_POSES = frozenset({"home", "look", REACH_POSE, CARRY_POSE})
 
 
 @dataclass(frozen=True)
@@ -38,6 +46,8 @@ CAPABILITIES: dict[str, Capability] = {
         Capability("approach_tag", {"object_id": str}, True, "Drive up to a tagged object."),
         Capability("gripper_open", {}, True, "Open the gripper."),
         Capability("gripper_close", {}, True, "Close the gripper."),
+        Capability("arm_pose", {"pose": str}, True,
+                   f"Move the arm to a saved pose ({', '.join(sorted(ARM_POSES))}). The claw does not change."),
         Capability("pick_tagged_object", {"object_id": str}, True, "Go to a tagged object and pick it up."),
         Capability("go_to_zone", {"zone": str}, True, "Drive to a named zone."),
         Capability("place_at_zone", {"zone": str}, True, "Carry the held object to a zone and set it down."),

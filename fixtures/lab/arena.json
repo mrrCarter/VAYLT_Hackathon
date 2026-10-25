@@ -1,12 +1,13 @@
 {
-  "note": "Made up demo lab. Object tags 1 to 4 and zone tags 10 to 14 are ArUco DICT_4X4_50. Print with scripts/make_tags.py.",
+  "note": "Made up demo lab. Object tags 1 to 5 and zone tags 10 to 15 are ArUco DICT_4X4_50. Print with scripts/make_tags.py. The pill bottle (tag 5) and the patient's place (tag 15) are for ENGRAM Assist (docs/ASSIST.md).",
   "start_zone": "home",
   "zones": [
     "home",
     "shelf_A",
     "shelf_B",
     "ppe_station",
-    "bench"
+    "bench",
+    "patient"
   ],
   "objects": [
     {
@@ -36,6 +37,20 @@
       "tag": 4,
       "zone": "shelf_B",
       "graspable": true
+    },
+    {
+      "id": "pill_bottle",
+      "name": "Pill bottle",
+      "tag": 5,
+      "zone": "shelf_B",
+      "graspable": true,
+      "aliases": [
+        "pills",
+        "pill",
+        "medicine",
+        "medication",
+        "meds"
+      ]
     }
   ],
   "zone_tags": {
@@ -43,6 +58,15 @@
     "11": "shelf_A",
     "12": "shelf_B",
     "13": "ppe_station",
-    "14": "bench"
+    "14": "bench",
+    "15": "patient"
+  },
+  "zone_aliases": {
+    "patient": [
+      "me",
+      "my",
+      "sofa",
+      "couch"
+    ]
   }
 }

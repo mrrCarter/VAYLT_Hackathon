@@ -110,6 +110,11 @@ def _chunks(text: str) -> list[tuple[str | None, int, int]]:
     return out
 
 
+def mentions(text: str, phrase: str) -> bool:
+    """Does text contain phrase as whole words? "my pills" mentions "pills"; "pillow" does not mention "pill"."""
+    return bool(phrase) and re.search(rf"\b{re.escape(phrase.lower())}\b", text.lower()) is not None
+
+
 def _fts_query(text: str) -> str:
     words = re.findall(r"[A-Za-z0-9]+", text.lower())
     stop = {
@@ -125,6 +130,11 @@ class Memory:
     def __init__(self, conn: sqlite3.Connection, freshness_s: float = DEFAULT_FRESHNESS_S):
         self.conn = conn
         self.freshness_s = freshness_s
+        # Other names people use, set from the arena file by Engine.load_arena: object id -> its aliases
+        # ("pills" for the pill bottle) and alias -> zone ("me" for the patient's place). They are
+        # configuration, like the zones themselves, so they are not stored in the database.
+        self.object_aliases: dict[str, tuple[str, ...]] = {}
+        self.zone_aliases: dict[str, str] = {}
 
     # ---- sources -------------------------------------------------------
 
@@ -266,12 +276,13 @@ class Memory:
         return [s for s in (self.object_state(i, at) for i in ids) if s]
 
     def resolve_object(self, phrase: str) -> list[ObjectState]:
-        """Match words like "sample B" or "goggles" to known objects."""
+        """Match words like "sample B", "goggles" or an alias from the arena ("my pills") to known objects."""
         phrase_l = phrase.lower()
         hits = []
         for obj in self.objects():
             name_l = obj.name.lower()
-            if name_l in phrase_l or obj.object_id.lower().replace("_", " ") in phrase_l:
+            if (name_l in phrase_l or obj.object_id.lower().replace("_", " ") in phrase_l
+                    or any(mentions(phrase_l, a) for a in self.object_aliases.get(obj.object_id, ()))):
                 hits.append(obj)
         return hits
 
