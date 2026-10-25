@@ -202,8 +202,9 @@ reject as rejected by "hand-signal" with the reason "patient signalled no".
 ### Run it on the laptop, against the robot's camera
 
 The robot server (port 8200) and the brain (port 8001) run on star-pi as in `docs/CDS_RUNBOOK.md`.
-The loop runs on the laptop, from the repo folder, with the repo's Python packages installed
-(`pip install -r requirements.txt`). If `star-pi.local` is not found, use the robot's address.
+The loop runs on the laptop, from the repo folder, with the repo's Python packages and Pillow installed
+(`pip install -r requirements.txt pillow`; without Pillow or OpenCV every frame fails and no signal is
+read). If `star-pi.local` is not found, use the robot's address.
 
 With the intent model (needs its key and model id; get them in person or by direct message, never
 through the room, and never put them in a file in the repo):
