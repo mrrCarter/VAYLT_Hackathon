@@ -43,6 +43,22 @@ a box or post by the sofa, facing the room).
 5. **Status any time:** `bash ~/engram_hub/scripts/cds_status.sh`. **Stop everything:**
    `bash ~/engram_hub/scripts/cds_down.sh` (Brian's server keeps running).
 
+**Rehearsed on 2026-10-25** (warden's PC; Brian's robot server code running on its simulator, the brain started
+exactly as `cds_up.sh --real` starts it, the console in brain mode, commands sent through the console's own
+iPad endpoints):
+
+- Every command in the table below reached the robot server as listed, and the robot's journal agrees.
+- "Bring me my pills" with the bottle out of view: the robot turned until it saw tag 5 (330 degrees), picked
+  it, turned until it saw tag 15 (120 degrees) and set it down.
+- Questions and "Remember that ..." never moved anything; "Don't pick it up" and "Move forward 3 meters"
+  were refused; "Stop." latched the stop.
+- Hand signals, read by the intent model from real photos: fist, then thumbs up ran "Pick it up"; fist,
+  then thumbs down cancelled it (nothing reached the robot); an open palm stopped the robot.
+
+**Not rehearsed:** anything on your Pi or your robot (arm poses, the claw, the camera's aim, the C920 at your
+distance and light, your network). Your first tries on the pretend robot, then with the wheels lifted, are
+what check those.
+
 **Safety, always:** "Stop", the iPad's STOP button, an open palm to the camera, or the motor power switch.
 Nothing moves without an approval, but the robot cannot see behind or beside itself: keep the floor clear.
 
@@ -97,6 +113,12 @@ time and at most one full turn, until it sees the tag, then picks; the place doe
 If it cannot find a tag after a full turn, that step fails ("not seen in 360 deg sweep") and nothing more
 happens. "Stop" while it turns stops it at once, and nothing is picked.
 
+**The camera is on the arm.** Brian's server aims it with a saved arm pose named `look` before it searches
+or picks. If the robot has no `look` pose, it searches with the arm wherever it is, and may not see tags on
+the floor. Brian: save one that points the camera ahead and slightly down
+(`robot/engram_robot/tools/arm_pose.py`); the server uses it automatically. Test it with "Look around."
+first: the reply lists the tags the camera sees.
+
 ## Changing them
 
 - **Tags and names:** `fixtures/lab/arena.json` (or your own copy, named by `ENGRAM_ARENA`). The pill
@@ -134,9 +156,15 @@ signal it sees, and tells the brain what to do. The rules live in
 | Fist | Sends "Pick it up" to the brain, the same way (lower the arm, close the claw, lift). |
 | Pointing, waving | Nothing (for now). |
 
-What the brain does with these two commands is in Commands and The pill bottle above. In
-particular, "Bring me my pills" needs a recent sighting of the pill bottle (tag 5) before the
-robot can move.
+What the brain does with these two commands is in Commands and The pill bottle above. "Bring me my
+pills" looks for tag 5 with the robot's own camera, turning in place if it has to.
+
+**Which signals read best** (measured on photos, `docs/VISION_EVIDENCE_2026-10-25.md`): open palm, thumbs
+up, thumbs down and the V sign read at 0.93 to 1.00. A fist seen face-on read at only 0.55 to 0.73 (below
+the 0.6 bar on some frames, so the hold resets); held up side-on it read 0.97. Hold each signal still for
+about a second, in good light, filling a good part of the frame. Before filming, run
+`python scripts/vision_ask.py hand --robot http://star-pi.local:8200 --every 1` and show each signal once to
+see what it reads at your distance and light.
 
 ### The safety rules, in plain words
 
