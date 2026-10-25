@@ -24,12 +24,15 @@ The safety rules. The map chooses which signal does what; it cannot change these
    while the last request to the brain is still running. A signal ignored that way is
    dropped, not saved for later: show it again.
 4. A thumbs-up approves only when exactly ONE plan is waiting, it was proposed less than 60 s
-   ago by the brain's own clock, and no thumbs-down cancelled it. It approves that plan's
-   digest and nothing else. Otherwise nothing is approved and the reason is logged.
-5. The brain has no endpoint to reject a plan, so a thumbs-down cannot remove one. It says
-   "Okay, cancelled", approves nothing, and remembers the plans waiting at that moment so no
-   later thumbs-up approves them. If the waiting plans cannot be read, thumbs-up approvals
-   stay off until any plan that was waiting then is too old to approve.
+   ago by the brain's own clock, and no thumbs-down turned it down. It approves that plan's
+   digest and nothing else. Otherwise nothing is approved and the reason is logged. The age is
+   the brain's age_s for the plan; only a plan without one is aged by the brain's Date header;
+   with neither, nothing is done with the plan.
+5. A thumbs-down rejects the waiting plan in the brain (POST /operations/{id}/reject) under the
+   same rule (exactly one waiting, less than 60 s old), and says "Okay, cancelled" only once the
+   brain confirms it. It also remembers every plan waiting at that moment, so no later thumbs-up
+   approves them even if the reject failed. If the waiting plans cannot be read, thumbs-up
+   approvals stay off until any plan that was waiting then is too old to approve.
 6. Anything malformed (an unknown signal name, a bad probability, a broken map) is no signal,
    or keeps the loop from starting. It never turns into an action.
 """
@@ -292,15 +295,40 @@ class Decider:
 # Rules 4 and 5: what a thumbs-up may approve
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
-class Approval:
+class WaitingPlan:
     operation_id: str
-    digest: str
+    digest: str   # "" when the brain sent none (then it can't be approved, only rejected)
     request: str
     age_s: float
 
 
+def _is_number(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+
+
+def plan_age(plan: dict, brain_now: float | None) -> tuple[float | None, str]:
+    """How long ago a waiting plan was proposed, by the brain's own clock: (seconds, "") or (None, why).
+
+    The brain's age_s for the plan when it has one. Only when it has none (missing or null): the
+    brain's clock from its Date header (brain_now, already rounded up) minus proposed_at. With
+    neither, the age is unknown and nothing may be done with the plan.
+    """
+    age_s = plan.get("age_s")
+    if age_s is not None:
+        if not _is_number(age_s):
+            return None, f"has an age_s that is not a number ({repr(age_s)[:30]})"
+        return float(age_s), ""
+    proposed_at = plan.get("proposed_at")
+    if not _is_number(proposed_at):
+        return None, "has no age_s and does not say when it was proposed"
+    if brain_now is None or not math.isfinite(brain_now):
+        return None, "has no age_s and the brain sent no Date header, so its age is unknown"
+    return brain_now - proposed_at, ""
+
+
 class ApproveGuard:
-    """Rules 4 and 5: what a thumbs-up may approve, and what a thumbs-down has turned down."""
+    """Rules 4 and 5: what a thumbs-up may approve, what a thumbs-down may reject, and the plans a
+    thumbs-down turned down (no thumbs-up approves them, even when the brain's reject failed)."""
 
     def __init__(self, max_age_s: float = APPROVE_MAX_AGE_S):
         self.max_age_s = max_age_s
@@ -308,8 +336,9 @@ class ApproveGuard:
         self.locked_until = -math.inf
 
     def cancel(self, pending: Any, now: float) -> list[str]:
-        """A thumbs-down. pending: GET /operations/pending, or None if it could not be read.
-        now: this computer's monotonic clock. Returns the operation ids now cancelled."""
+        """A thumbs-down: remember every plan waiting now (the backstop, kept whatever the reject
+        does). pending: GET /operations/pending, or None if it could not be read. now: this
+        computer's monotonic clock. Returns the operation ids remembered."""
         if not isinstance(pending, list):
             # Whatever was waiting is unknown: no thumbs-up approvals until all of it is too old.
             self.locked_until = max(self.locked_until, now + self.max_age_s + DATE_SLACK_S)
@@ -318,7 +347,7 @@ class ApproveGuard:
         self.cancelled.update(ids)
         return ids
 
-    def check(self, pending: Any, brain_now: float | None, now: float) -> tuple[Approval | None, str]:
+    def check(self, pending: Any, brain_now: float | None, now: float) -> tuple[WaitingPlan | None, str]:
         """(the one plan a thumbs-up may approve, "") or (None, why not).
 
         pending: GET /operations/pending. brain_now: the brain's clock when it answered (from its
@@ -327,33 +356,46 @@ class ApproveGuard:
         if now < self.locked_until:
             return None, (f"thumbs-up approvals are off for {self.locked_until - now:.1f} s more: a thumbs-down"
                           " could not read which plans were waiting")
+        plan, why = self._one_recent(pending, brain_now)
+        if plan is None:
+            return None, why
+        if not _DIGEST.fullmatch(plan.digest):
+            return None, f"plan {plan.operation_id} has no valid digest"
+        if plan.operation_id in self.cancelled:
+            return None, f"plan {plan.operation_id} was cancelled with a thumbs-down"
+        return plan, ""
+
+    def to_reject(self, pending: Any, brain_now: float | None) -> tuple[WaitingPlan | None, str]:
+        """(the one plan a thumbs-down may reject, "") or (None, why not). The same rule as a
+        thumbs-up, without the digest (a reject moves nothing) and without the remembered plans
+        (a second thumbs-down tries again a reject that failed)."""
+        return self._one_recent(pending, brain_now)
+
+    def _one_recent(self, pending: Any, brain_now: float | None) -> tuple[WaitingPlan | None, str]:
+        """The rule both share: exactly one plan waiting, proposed less than max_age_s ago."""
         if not isinstance(pending, list):
             return None, "the brain's list of waiting plans is not a list"
         if len(pending) != 1:
             return None, ("no plan is waiting for approval" if not pending else
-                          f"{len(pending)} plans are waiting; a thumbs-up approves only when exactly one is"
+                          f"{len(pending)} plans are waiting; a hand signal acts only when exactly one is"
                           " (use the iPad)")
         plan = pending[0]
         if not isinstance(plan, dict):
             return None, "the waiting plan is not a JSON object"
-        op_id, plan_digest, proposed_at = plan.get("operation_id"), plan.get("digest"), plan.get("proposed_at")
+        op_id = plan.get("operation_id")
         if not isinstance(op_id, str) or not _OPERATION_ID.fullmatch(op_id):
             return None, "the waiting plan has no usable operation id"
-        if not isinstance(plan_digest, str) or not _DIGEST.fullmatch(plan_digest):
-            return None, f"plan {op_id} has no valid digest"
-        if op_id in self.cancelled:
-            return None, f"plan {op_id} was cancelled with a thumbs-down"
-        if isinstance(proposed_at, bool) or not isinstance(proposed_at, (int, float)) or not math.isfinite(proposed_at):
-            return None, f"plan {op_id} does not say when it was proposed"
-        if brain_now is None or not math.isfinite(brain_now):
-            return None, "the brain did not send its clock (no Date header), so the plan's age is unknown"
-        age = brain_now - proposed_at
+        age, why = plan_age(plan, brain_now)
+        if age is None:
+            return None, f"plan {op_id} {why}"
         if age < -DATE_SLACK_S:
-            return None, f"plan {op_id} is dated {-age:.0f} s ahead of the brain's clock; not approving"
+            return None, f"plan {op_id} is dated {-age:.0f} s ahead of the brain's clock; not acting on it"
         if age >= self.max_age_s:
-            return None, (f"plan {op_id} is {age:.0f} s old; a thumbs-up approves only plans less than"
+            return None, (f"plan {op_id} is {age:.0f} s old; a hand signal acts only on plans less than"
                           f" {self.max_age_s:.0f} s old")
-        return Approval(op_id, plan_digest, str(plan.get("request") or ""), round(max(age, 0.0), 1)), ""
+        plan_digest = plan.get("digest")
+        return WaitingPlan(op_id, plan_digest if isinstance(plan_digest, str) else "",
+                           str(plan.get("request") or ""), round(max(age, 0.0), 1)), ""
 
 
 # ---------------------------------------------------------------------------
