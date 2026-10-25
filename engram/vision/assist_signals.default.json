@@ -1,0 +1,16 @@
+{
+  "about": "ENGRAM Assist: which hand signal does what. See docs/ASSIST.md before changing it. Signals: open_palm, thumbs_up, thumbs_down, pointing, fist, peace, waving. Actions: stop, approve, cancel, command (needs text), none. Optional on any action but none: say, a short sentence said out loud on the laptop. A signal left out does nothing. At least one signal must stop.",
+  "signals": {
+    "open_palm": {"action": "stop"},
+    "thumbs_up": {"action": "approve"},
+    "thumbs_down": {"action": "cancel", "say": "Okay, cancelled"},
+    "peace": {"action": "command", "text": "Bring me my pills"},
+    "fist": {"action": "command", "text": "Pick it up"},
+    "pointing": {"action": "none"},
+    "waving": {"action": "none"}
+  },
+  "hold_frames": 2,
+  "hold_seconds": 0.6,
+  "min_probability": 0.6,
+  "cooldown_s": 3.0
+}
