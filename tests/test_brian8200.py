@@ -169,6 +169,15 @@ def test_a_stop_latched_between_the_search_and_the_pick_means_no_pick(brian):
     assert ops(fake) == ["detect_tag", "search_tag"]
 
 
+def test_a_stop_latched_between_the_look_and_the_search_means_no_search(brian):
+    robot, fake = brian
+    fake.reply = HIDDEN
+    fake.hooks = {"detect_tag": lambda: setattr(fake, "stops", fake.stops + 1)}   # Stop pressed while it looked
+    out = robot.execute("pick_tagged_object", {"object_id": "beaker"})
+    assert out.status == "failed" and "did not turn to look for tag 4" in out.detail
+    assert ops(fake) == ["detect_tag"]
+
+
 def test_a_search_cut_short_is_unknown_stops_the_robot_and_is_never_retried(brian):
     robot, fake = brian
     fake.reply = {**HIDDEN, "search_tag": ("ABORTED", "E_ESTOP")}
