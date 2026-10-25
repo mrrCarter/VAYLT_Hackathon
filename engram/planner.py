@@ -89,26 +89,32 @@ def refusal(request: str, future_ok: bool = False) -> str | None:
 
 # A place a request names: a destination with an article or a possessive ("to the kitchen", "on my desk"), or
 # "here" / "there". With no zone named, "in a minute" reads as one too: unclear either way, and never planned now.
-PLACE = re.compile(r"\b(?:to|into|onto|on|at|in)\s+(?:the|my|your|our|his|her|their|a|an|this|that)\s+\w"
+PLACE = re.compile(r"\b(?:to|into|onto|on|at|in)\s+(?:the|my|your|our|his|her|their|a|an|this|that)\s+(\w+)"
                    r"|\b(?:here|there)\b")
 
 
 def find_zone(request: str, zones: set[str], aliases: Mapping[str, str] | None = None) -> str | None:
-    """Where a request sends things: the zone it names ("from <zone>" is where they come from, not where they go);
-    else one an alias names ("me" -> the patient's place); DEFAULT_ZONE when it names no place at all; or None
-    when it names a place that is neither a zone nor an alias ("to the kitchen", "over here"). That request is
-    unclear: it is asked which place, and the bench is never guessed. A named zone wins, so "Bring my pills to
-    the bench" still goes to the bench."""
+    """Where a request sends things: the zone it names ("from <zone>" is where they come from, not where they go).
+    Else an explicit destination decides on its own: its noun may be an alias ("to the sofa" -> the patient's
+    place), and any other named place ("to the kitchen", "on my desk", "here") returns None. That request is
+    unclear: it is asked which place, and the bench is never guessed. Only with no destination named does an
+    alias anywhere in the request decide ("Bring me my pills" -> the patient's place); with nothing at all, it is
+    DEFAULT_ZONE. A named zone wins, so "Bring my pills to the bench" still goes to the bench, and "my" in
+    "Bring my pills to the kitchen" never decides."""
     low = request.lower()
     for z in zones:
         low = re.sub(rf"\bfrom\s+(?:the\s+)?{re.escape(z.replace('_', ' ').lower())}\b", " ", low)
     for z in sorted(zones, key=len, reverse=True):
         if z.replace("_", " ").lower() in low:
             return z
-    for alias, z in sorted((aliases or {}).items(), key=lambda kv: len(kv[0]), reverse=True):
-        if z in zones and mentions(low, alias):
+    known = {a: z for a, z in (aliases or {}).items() if z in zones}
+    m = PLACE.search(low)
+    if m:
+        return known.get(m.group(1)) if m.group(1) else None
+    for alias, z in sorted(known.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if mentions(low, alias):
             return z
-    return None if PLACE.search(low) else DEFAULT_ZONE
+    return DEFAULT_ZONE
 
 
 def targets_in(request: str, memory: Memory) -> list[str]:

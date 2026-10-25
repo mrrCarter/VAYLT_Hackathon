@@ -303,9 +303,25 @@ def test_aliases_match_whole_words_only(engine):
     zones, aliases = {"bench", "patient"}, {"me": "patient", "sofa": "nowhere"}
     assert find_zone("bring it to me", zones, aliases) == "patient"
     assert find_zone("bring the medium beaker", zones, aliases) == "bench"      # "medium" is not "me"
-    assert find_zone("bring it to the sofa", zones, aliases) == "bench"         # an alias to no known zone
+    assert find_zone("bring it to the sofa", zones, aliases) is None           # an alias to no known zone: unclear, never the bench
     assert [o.object_id for o in engine.memory.resolve_object("my pills")] == ["pill_bottle"]
     assert engine.memory.resolve_object("my pillow") == []                    # "pillow" is not "pill"
+
+
+def test_an_explicit_destination_decides_and_my_never_does(arena):
+    # Carter's rule: an unknown place is unclear (asked "Which place do you mean?"), never the bench, and never the
+    # patient just because the request says "my" ("my pills" names whose pills, not where they go).
+    zones = set(arena["zones"])
+    aliases = {a.lower(): z for z, names in arena["zone_aliases"].items() for a in names}
+    assert find_zone("Bring me my pills", zones, aliases) == "patient"
+    assert find_zone("Bring my pills", zones, aliases) == "patient"
+    assert find_zone("Bring it to me", zones, aliases) == "patient"
+    assert find_zone("Bring my pills to the sofa", zones, aliases) == "patient"     # the noun is an alias
+    assert find_zone("Bring my pills to the bench", zones, aliases) == "bench"      # a named zone wins
+    assert find_zone("Bring my pills to the kitchen", zones, aliases) is None       # not "patient" via "my"
+    assert find_zone("Put it on my desk", zones, aliases) is None
+    assert find_zone("Bring it here", zones, aliases) is None
+    assert find_zone("Pick up the beaker", zones, aliases) == "bench"               # no place named: the default
 
 
 def test_the_arena_holds_the_pill_bottle_and_the_patient_tags(arena, engine):
