@@ -19,6 +19,16 @@ While a step runs we send heartbeats, so if the brain dies mid move the robot st
 except that drive, turn, claw and arm steps that come back UNKNOWN with code E_UNVERIFIED count as
 done, with "not sensor checked" in the detail. Those steps have no sensor on this robot, so they are
 always UNKNOWN; our own 8100 agent treated the same timed moves as done.
+
+There is no overhead camera on this robot, so finding a tag uses the robot's own camera:
+    locate_tag  a fresh sighting in memory, else Brian's detect_tag (three frames, never moves). Not in
+                view is still done: the pick that follows turns to look for it.
+    pick_tagged_object, place_at_zone
+                inside the approved step, detect_tag first; if the tag is not in view, search_tag (turn
+                in place in 30 degree steps, at most a full turn), then pick_tagged or place_at. A search
+                that does not find it fails the step (E_TAG_NOT_FOUND) and nothing more is sent. The stop
+                latch is checked before every call, every call is signed, heartbeats run throughout, and
+                a call whose outcome is unknown stops the robot and is never retried.
 """
 
 from __future__ import annotations
@@ -33,8 +43,9 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from ..capabilities import ARM_POSES
 from ..memory import Memory
@@ -44,6 +55,8 @@ from .base import ActionResult, RobotAdapter
 # "reach_down" is robot_agent's older name for his "reach".
 POSE_NAMES = {**{p: p for p in ARM_POSES}, "reach_down": "reach"}
 UNSENSED_OK = {"drive_bounded", "turn_bounded", "gripper_open", "gripper_close", "arm_pose"}
+SEARCH_MAX_DEG = 360.0   # search_tag turns in place in 30 degree steps, at most this far
+FIND_FIRST = {"pick_tagged": "tag_id", "place_at": "zone_tag_id"}   # Brian's ops that need their tag in view
 
 
 def read_secret(path: str | os.PathLike) -> str:
@@ -140,10 +153,7 @@ class BrianRobot(RobotAdapter):
             tags = [t.get("tag_id") for t in (out.get("data") or {}).get("tags", [])]
             return ActionResult("done" if out.get("status") == "SUCCEEDED" else "failed", f"robot camera sees tags {tags}")
         if op == "locate_tag":
-            s = self.memory.object_state(args["object_id"])
-            if s and s.last_zone and not s.stale:
-                return ActionResult("done", f"{s.name} at {s.last_zone}")
-            return ActionResult("failed", f"overhead camera has not seen {args['object_id']} recently")
+            return self._locate(args["object_id"])
         if op in ("speak", "ask", "remember", "schedule"):
             return ActionResult("done", str(next(iter(args.values()), "")))
 
@@ -151,25 +161,96 @@ class BrianRobot(RobotAdapter):
         if isinstance(mapped, str):
             return ActionResult("failed", mapped)
         b_op, b_args = mapped
+        note = ""
+        try:
+            with self._link():
+                if b_op in FIND_FIRST:
+                    found = self._find(op, b_args[FIND_FIRST[b_op]])
+                    if isinstance(found, ActionResult):
+                        return found
+                    note = found
+                out = self._send(b_op, b_args)
+        except Exception as e:
+            # We sent a motion command and lost the answer. It may or may not have moved.
+            self.stop()
+            return ActionResult("unknown", f"lost contact with robot: {e}")
+        res = self._result(op, out)
+        return ActionResult(res.status, f"{note}; {res.detail}" if note else res.detail)
+
+    def _send(self, b_op: str, b_args: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
+        """One signed /robot/execute call with its own operation id. Raises if the answer is lost."""
         operation_id = self._id()
-        body = {"op": b_op, "args": b_args, "operation_id": operation_id,
-                "authorization": sign(self.secret, operation_id, b_op, b_args)}
+        return self._call("/robot/execute", {"op": b_op, "args": b_args, "operation_id": operation_id,
+                                             "authorization": sign(self.secret, operation_id, b_op, b_args)},
+                          timeout=timeout)
+
+    @contextmanager
+    def _link(self) -> Iterator[None]:
+        """Heartbeats while a step's calls run, so the robot stops by itself if the brain dies mid step."""
         done = threading.Event()
         threading.Thread(target=self._beat, args=(done,), daemon=True).start()
         try:
-            out = self._call("/robot/execute", body)
-        except Exception as e:
-            # We sent a motion command and lost the answer. It may or may not have moved.
-            done.set()
-            self.stop()
-            return ActionResult("unknown", f"lost contact with robot: {e}")
+            yield
         finally:
             done.set()
             try:
                 self._call("/robot/link/release", {}, timeout=2.0)
             except Exception:
                 pass
-        return self._result(op, out)
+
+    def _stopped(self) -> bool:
+        return bool(self.state().get("stopped"))   # an unreachable robot counts as stopped
+
+    def _look(self, tag: int) -> tuple[bool | None, str]:
+        """Does the robot's camera see this tag now? Brian's detect_tag looks at three frames and never moves.
+        (True, where it is), (False, not in view), or (None, why it could not look)."""
+        try:
+            out = self._send("detect_tag", {"tag_id": tag}, timeout=10.0)
+        except Exception as e:
+            return None, f"could not ask the robot camera: {e}"
+        if out.get("status") == "SUCCEEDED":
+            d = (out.get("data") or {}).get("detection") or {}
+            return True, f"robot camera sees tag {tag} at {d.get('distance_m', '?')} m, {d.get('bearing_deg', '?')} deg"
+        if out.get("code") == "E_TAG_NOT_FOUND":
+            return False, f"tag {tag} not in view now"
+        return None, f"robot camera: {out.get('status')} {out.get('code') or ''}: {out.get('message', '')}"
+
+    def _locate(self, object_id: str) -> ActionResult:
+        """A fresh sighting in memory, else the robot's own camera. Never moves."""
+        s = self.memory.object_state(object_id)
+        if s and s.last_zone and not s.stale:
+            return ActionResult("done", f"{s.name} at {s.last_zone}")
+        if s is None or s.tag_id is None:
+            return ActionResult("failed", f"{object_id} has no tag")
+        seen, detail = self._look(s.tag_id)
+        if seen is None:
+            return ActionResult("failed", detail)   # a camera that cannot look is not "out of view"
+        return ActionResult("done", detail if seen else f"{detail}; the robot will turn to look for it when it picks it up")
+
+    def _find(self, op: str, tag: int) -> str | ActionResult:
+        """Inside an approved pick or place, before Brian's pick_tagged or place_at: get the tag into view.
+
+        Looks first (no motion); if it is not in view, turns in place to look for it. Returns a note
+        on what it did, or the result to end the step with: the search did not find it (failed),
+        was cut short (unknown, robot stopped, never retried), or the stop latch was set between
+        calls (failed: nothing more is sent).
+        """
+        if self._stopped():
+            return ActionResult("failed", f"robot is stopped; {op} did not start")
+        seen, detail = self._look(tag)
+        if seen:
+            return detail
+        if seen is None:
+            return ActionResult("failed", f"{detail}; {op} did not start")
+        if self._stopped():
+            return ActionResult("failed", f"robot is stopped; did not turn to look for tag {tag}")
+        out = self._send("search_tag", {"tag_id": tag, "max_turn_deg": SEARCH_MAX_DEG})
+        if out.get("status") != "SUCCEEDED":
+            res = self._result(op, out)
+            return ActionResult(res.status, f"looked for tag {tag}: {res.detail}")
+        if self._stopped():
+            return ActionResult("failed", f"stop pressed after the robot found tag {tag}; {op} did not start")
+        return out.get("message") or f"found tag {tag}"
 
     def _result(self, op: str, out: dict[str, Any]) -> ActionResult:
         status, code = out.get("status"), out.get("code")

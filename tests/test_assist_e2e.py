@@ -94,33 +94,50 @@ class Rig:
                 for r in rows if r["phase"] == "started"]
 
 
-@pytest.fixture
-def rig(tmp_path, monkeypatch):
-    """The pill bottle (tag 5) 0.8 m in front of the robot, the patient's marker (tag 15) on a post beyond it."""
-    cfg = Config()
-    sim = SimDriver(cfg, tags=[SimTag(5, 0.8, 0.05), SimTag(15, 1.6, 0.4, kind="zone", lidar_radius=0.04)],
-                    range_sensor="ultrasonic")
-    service = RobotService(sim, cfg, SECRET, str(tmp_path / "robot_journal.jsonl"))
-    robot_url, robot_server, robot_thread = serve(robot_app(service))
-    key = tmp_path / "robot.env"
-    key.write_text(f"ENGRAM_ROBOT_SECRET={SECRET}\n")
-    monkeypatch.setenv("ENGRAM_ROBOT_API", "brian")
-    monkeypatch.setenv("ENGRAM_ROBOT_URL", robot_url)
-    monkeypatch.setenv("ENGRAM_ROBOT_KEY_FILE", str(key))
-    monkeypatch.setenv("ENGRAM_DB", str(tmp_path / "engram.db"))
-    for name in ("ENGRAM_ARENA", "ENGRAM_LLM_URL", "ENGRAM_VOICE_PRESETS"):
-        monkeypatch.delenv(name, raising=False)
-    from engram.api import create_app, default_engine
+# Where the pill bottle (tag 5) and the patient's marker (tag 15, on a post) stand; the robot starts at (0, 0)
+# facing +x. IN_VIEW: both ahead. HIDDEN: the bottle behind the robot, and the marker out of view after the pick.
+IN_VIEW = ((5, 0.8, 0.05, "object"), (15, 1.6, 0.4, "zone"))
+HIDDEN = ((5, -0.8, 0.05, "object"), (15, -0.6, -0.9, "zone"))
 
-    engine = default_engine()
-    assert engine.robot.state()["adapter"] == "brian8200"
-    brain_url, brain_server, brain_thread = serve(create_app(engine))
-    yield Rig(brain_url, robot_url, service, sim)
-    brain_server.should_exit = robot_server.should_exit = True
-    brain_thread.join(10)
-    robot_thread.join(10)
-    engine.conn.close()
-    service.close()
+
+@pytest.fixture
+def make_rig(tmp_path, monkeypatch):
+    made = []
+
+    def make(world=IN_VIEW):
+        cfg = Config()
+        tags = [SimTag(t, x, y, kind=kind, lidar_radius=0.04 if kind == "zone" else 0.0) for t, x, y, kind in world]
+        sim = SimDriver(cfg, tags=tags, range_sensor="ultrasonic")
+        service = RobotService(sim, cfg, SECRET, str(tmp_path / "robot_journal.jsonl"))
+        robot_url, robot_server, robot_thread = serve(robot_app(service))
+        key = tmp_path / "robot.env"
+        key.write_text(f"ENGRAM_ROBOT_SECRET={SECRET}\n")
+        monkeypatch.setenv("ENGRAM_ROBOT_API", "brian")
+        monkeypatch.setenv("ENGRAM_ROBOT_URL", robot_url)
+        monkeypatch.setenv("ENGRAM_ROBOT_KEY_FILE", str(key))
+        monkeypatch.setenv("ENGRAM_DB", str(tmp_path / "engram.db"))
+        for name in ("ENGRAM_ARENA", "ENGRAM_LLM_URL", "ENGRAM_VOICE_PRESETS"):
+            monkeypatch.delenv(name, raising=False)
+        from engram.api import create_app, default_engine
+
+        engine = default_engine()
+        assert engine.robot.state()["adapter"] == "brian8200"
+        brain_url, brain_server, brain_thread = serve(create_app(engine))
+        made.append((brain_server, brain_thread, robot_server, robot_thread, engine, service))
+        return Rig(brain_url, robot_url, service, sim)
+
+    yield make
+    for brain_server, brain_thread, robot_server, robot_thread, engine, service in made:
+        brain_server.should_exit = robot_server.should_exit = True
+        brain_thread.join(10)
+        robot_thread.join(10)
+        engine.conn.close()
+        service.close()
+
+
+@pytest.fixture
+def rig(make_rig):
+    return make_rig()
 
 
 def test_pick_it_up_then_put_it_down(rig):
@@ -181,16 +198,40 @@ def test_stop_stops_a_drive_in_progress_and_stays_stopped(rig):
     assert again["outcome"] == "aborted" and len(rig.journal()) == 1
 
 
-def test_bring_me_my_pills_picks_tag_5_and_places_it_at_tag_15(rig):
-    # Where things are comes from memory: this is the sighting the overhead camera would post.
-    call(rig.brain + "/observations/tag", {"tag_id": 5, "zone": "shelf_B"})
-    p = rig.command("Bring me my pills")
-    assert [(s["op"], s["args"]) for s in p["plan"]["steps"]] == [
-        ("locate_tag", {"object_id": "pill_bottle"}), ("pick_tagged_object", {"object_id": "pill_bottle"}),
-        ("place_at_zone", {"zone": "patient"}), ("speak", {"text": "Done. Pill bottle at patient."})]
+PILL_PLAN = [("locate_tag", {"object_id": "pill_bottle"}), ("pick_tagged_object", {"object_id": "pill_bottle"}),
+             ("place_at_zone", {"zone": "patient"}), ("speak", {"text": "Done. Pill bottle at patient."})]
+SEARCH_5 = ("search_tag", {"tag_id": 5, "max_turn_deg": 360.0})
+SEARCH_15 = ("search_tag", {"tag_id": 15, "max_turn_deg": 360.0})
+
+
+def test_bring_me_my_pills_turns_to_find_the_bottle_and_the_patient(make_rig):
+    rig = make_rig(HIDDEN)
+    p = rig.command("Bring me my pills")                # no sighting posted: this robot has no overhead camera
+    assert [(s["op"], s["args"]) for s in p["plan"]["steps"]] == PILL_PLAN
     out = rig.approve(p)
     assert out["outcome"] == "success", out
-    assert rig.journal() == [("pick_tagged", {"tag_id": 5}, "SUCCEEDED", "OK"),
+    assert rig.journal() == [("detect_tag", {"tag_id": 5}, "FAILED", "E_TAG_NOT_FOUND"),    # locate: only looks
+                             ("detect_tag", {"tag_id": 5}, "FAILED", "E_TAG_NOT_FOUND"),    # the pick looks first,
+                             (*SEARCH_5, "SUCCEEDED", "OK"),                               # turns until it sees it,
+                             ("pick_tagged", {"tag_id": 5}, "SUCCEEDED", "OK"),             # then picks
+                             ("detect_tag", {"tag_id": 15}, "FAILED", "E_TAG_NOT_FOUND"),
+                             (*SEARCH_15, "SUCCEEDED", "OK"),
+                             ("place_at", {"zone_tag_id": 15}, "SUCCEEDED", "OK")]
+    moves = [(op, args) for op, args, _, _ in rig.journal() if op != "detect_tag"]
+    assert moves == [SEARCH_5, ("pick_tagged", {"tag_id": 5}), SEARCH_15, ("place_at", {"zone_tag_id": 15})]
+    locate, pick = out["steps"][:2]
+    assert "not in view now; the robot will turn to look for it" in locate["detail"]
+    assert pick["detail"].startswith("found tag 5 after")
+    assert rig.sim.held is None and math.hypot(rig.sim.tags[5].x + 0.6, rig.sim.tags[5].y + 0.9) < 0.4
+
+
+def test_bring_me_my_pills_with_both_in_view_does_not_search(rig):
+    out = rig.approve(rig.command("Bring me my pills"))
+    assert out["outcome"] == "success", out
+    assert rig.journal() == [("detect_tag", {"tag_id": 5}, "SUCCEEDED", "OK"),
+                             ("detect_tag", {"tag_id": 5}, "SUCCEEDED", "OK"),
+                             ("pick_tagged", {"tag_id": 5}, "SUCCEEDED", "OK"),
+                             ("detect_tag", {"tag_id": 15}, "SUCCEEDED", "OK"),
                              ("place_at", {"zone_tag_id": 15}, "SUCCEEDED", "OK")]
     assert rig.sim.held is None and math.hypot(rig.sim.tags[5].x - 1.6, rig.sim.tags[5].y - 0.4) < 0.4
 
@@ -205,7 +246,29 @@ def test_a_rejected_plan_never_reaches_the_robot(rig):
     assert rig.journal() == [] and rig.sim.odometry()[:2] == (0.0, 0.0)
 
 
-def test_without_a_recent_sighting_the_pill_fetch_stops_before_the_robot_moves(rig):
+def test_a_bottle_that_is_not_there_fails_honestly_after_one_full_turn(make_rig):
+    rig = make_rig(((15, 1.6, 0.4, "zone"),))          # no pill bottle anywhere
     out = rig.approve(rig.command("Bring me my pills"))
-    assert out["outcome"] == "failed" and "has not seen pill_bottle recently" in out["failure"], out
-    assert rig.journal() == [] and rig.sim.odometry()[:2] == (0.0, 0.0)
+    assert out["outcome"] == "failed" and "looked for tag 5: FAILED E_TAG_NOT_FOUND" in out["failure"], out
+    assert rig.journal() == [("detect_tag", {"tag_id": 5}, "FAILED", "E_TAG_NOT_FOUND"),
+                             ("detect_tag", {"tag_id": 5}, "FAILED", "E_TAG_NOT_FOUND"),
+                             (*SEARCH_5, "FAILED", "E_TAG_NOT_FOUND")]       # no pick, no place
+    x, y, _ = rig.sim.odometry()
+    assert math.hypot(x, y) < 0.01                                          # it turned in place, never drove
+
+
+def test_stop_while_it_turns_to_look_means_no_pick(make_rig):
+    # The runbook's stop test: hide the tag, approve the fetch, press stop while the robot turns.
+    rig = make_rig(HIDDEN)
+    p = rig.command("Bring me my pills")
+    result = {}
+    run = threading.Thread(target=lambda: result.update(rig.approve(p)))
+    run.start()
+    wait_until(lambda: rig.sim.velocity()[1] != 0, 15)                    # turning in place, looking
+    assert rig.command("Stop")["kind"] == "stopped"
+    run.join(30)
+    assert result["outcome"] == "aborted", result
+    assert rig.journal() == [("detect_tag", {"tag_id": 5}, "FAILED", "E_TAG_NOT_FOUND"),
+                             ("detect_tag", {"tag_id": 5}, "FAILED", "E_TAG_NOT_FOUND"),
+                             (*SEARCH_5, "ABORTED", "E_ESTOP")]
+    assert rig.service.safety.estop_latched and rig.sim.velocity() == (0.0, 0.0)
