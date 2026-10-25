@@ -252,7 +252,7 @@ class Engine:
         fixed = self._fixed_steps(request)
         skill = self.skills.find(targets, zone) if targets and fixed is None else None
         if isinstance(fixed, str):   # a fixed request it recognized but will not plan, e.g. past a bound
-            res = PlanResult(None, refused=fixed)
+            res = PlanResult(None, classification="understood", refused=fixed)   # understood, refused: stops nothing
         elif fixed is not None:
             plan = {"goal": request, "steps": copy.deepcopy(fixed), "evidence": [], "rules_used": []}
             res = PlanResult(plan, classification="understood", planner_calls=0, source="fixed", targets=targets,
