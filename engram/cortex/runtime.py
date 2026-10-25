@@ -13,14 +13,18 @@ from pathlib import Path
 from typing import Any
 
 from .learning import Activity,Dreamer,Skills
-from .models import IntentAdvisor,QwenClient,ModelUnavailable
-from .planning import CAPS,FORBIDDEN,PHYSICAL,RECALL,Compiler,asks_memory,parse_goal,safety_reason,validate_step,verify
-from .store import Store
+from .models import IntentAdvisor,QwenClient,ModelUnavailable,model_context,prompt_refs
+from .planning import CAPS,CLAW,CLAW_BOUND,FORBIDDEN,PHYSICAL,RECALL,STOP_WORDS,Compiler,CompilerGap,asks_memory,parse_goal,safety_reason,validate_step,verify
+from .store import JOURNAL_STATES,TASK_STATE,Store
 from .seeding import synthetic_seed_present
 from . import vault_lock
 from .types import Conflict,CortexError,Denied,Goal,Missing,Stale,canonical,digest,normalize,text,uid
 
 WHEN=re.compile(r'^\s*(?:when|once|after|as soon as)\s+(.+?),\s*(?:then\s+)?(.+)$',re.I)
+UNREPORTED=object()   # a claw state the adapter did not report: unknown, never equal to any report
+# The system events every operator sees (/events): they carry no operator's details. Any other event with no operation
+# is the operator's who caused it (journal(owner=...)), and one with neither (an older version's) is nobody's.
+PUBLIC_EVENTS=('stop','clock_jump')
 
 
 def taken(result: dict,classification: str) -> dict:
@@ -53,15 +57,20 @@ class Brain:
         self.qwen=qwen; self.intent=intent or IntentAdvisor(enabled=False)
         self.compiler=Compiler(store); self.skills=Skills(store); self.activity=Activity()
         self.dreamer=Dreamer(store,self.skills,self.activity,qwen,self.intent)
-        self._recoverable_preparing=set(); self._effect_lock=threading.Lock(); self._stopped=threading.Event(); self._file_lock=None
+        self._recoverable_preparing=set(); self._effect_lock=threading.Lock(); self._stopped=threading.Event(); self._stop_gen=0; self._file_lock=None
+        self._stop_requests=0    # operator STOPs so far: each revokes every proposal whose request began before it
         self.mode='SIMULATED' if robot.state().get('adapter')=='mock' else 'PHYSICAL'
         if self.mode=='PHYSICAL' and not store.policy.live_enabled:
             raise Denied('live adapter requires an explicit trusted enablement and witnessed hardware acceptance')
         if self.mode=='PHYSICAL' and synthetic_seed_present(store):
             raise Denied('this vault contains synthetic seed data (scripts/cortex_seed.py); a physical runtime must start on a separate, unseeded vault (set CORTEX_DB to a new file)')
-        store.runtime_mode=self.mode   # only a runtime that actually starts owns the vault's mode (load_seed checks it)
         if acquire_lock and store.path!=':memory:' and store.file_lock is None:
             self._file_lock=vault_lock.acquire(store.path)
+        # Unresolved physical effects must survive a restart, and one process must own the robot: a physical runtime
+        # needs a file-backed vault that this process holds the exclusive lock of.
+        if self.mode=='PHYSICAL' and (store.path==':memory:' or not (store.file_lock or self._file_lock)):
+            raise Denied('a physical runtime needs a durable vault it holds the exclusive lock of: open a file-backed Store (CORTEX_DB)')
+        store.runtime_mode=self.mode   # only a runtime that actually starts owns the vault's mode (load_seed checks it)
         self.recover()
         if qwen: store.manifest('qwen','parametric',qwen.manifest())
         store.manifest('intent','parametric',{'model':self.intent.model or None,'enabled':store.policy.cloud_enabled,
@@ -75,6 +84,15 @@ class Brain:
         self.store.close()
 
     def recover(self):
+        # An execution the restart interrupted may still be moving on the controller (the latch blocks new approvals, not
+        # that motion), and a stop latched before the restart must hold on this adapter too. So STOP goes to the adapter
+        # first, before any store work, and is confirmed; the latch stays until an operator clears it (clear_stop).
+        interrupted=self.store.rows("SELECT id FROM episode WHERE outcome='running' AND id IN (SELECT id FROM cx_episode)")
+        stopped=None
+        if interrupted or self.store.one("SELECT 1 FROM meta WHERE key='cortex_stop'"):
+            self._stopped.set()
+            try: self.robot.stop(); stopped=bool(self.robot.state().get('stopped'))
+            except Exception: stopped=False
         with self.store.tx():
             self._recoverable_preparing={r['id'] for r in self.store.rows("SELECT id FROM episode WHERE outcome='preparing' AND id IN (SELECT id FROM cx_episode)")}
             running=self.store.rows("SELECT id FROM episode WHERE outcome='running' AND id IN (SELECT id FROM cx_episode)")
@@ -83,11 +101,21 @@ class Brain:
                 self.journal(r['id'],'recovery',{},'unknown','requires operator reconciliation')
             if running: self._latch('restart interrupted execution')
             if self.store.one("SELECT 1 FROM meta WHERE key='cortex_stop'"): self._stopped.set()
-            self.store.conn.execute("UPDATE episode SET outcome='expired' WHERE outcome='proposed' AND id IN (SELECT id FROM cx_episode WHERE expires_at<?)",(self.store.clock(),))
+            self._expire()
             self.store.conn.execute("UPDATE cx_wake SET status='pending' WHERE status='preparing'")
-            # Existing task links remain durable; recovery never dispatches physical effects.
-            for r in self.store.rows("SELECT id,outcome FROM episode WHERE outcome IN ('unknown','success','failed','aborted','cancelled','rejected')"):
+            # Existing task links remain durable; recovery never dispatches physical effects. Every settled outcome reaches
+            # its commitment, an expiry or invalidation an older version left unreconciled too.
+            for r in self.store.rows(f"SELECT id,outcome FROM episode WHERE outcome IN ({','.join('?'*len(TASK_STATE))})",tuple(TASK_STATE)):
                 self.store.finish_task(r['id'],r['outcome'])
+        if stopped is not None:
+            self.journal(None,'stop',{},'confirmed' if stopped else 'requested',
+                         'on restart: '+('the adapter confirmed it' if stopped else 'the adapter did not confirm it; send STOP again'))
+
+    def _expire(self):
+        """Proposals past their approval window expire, each one's commitment with it (Store.settle)."""
+        with self.store.tx():
+            for r in self.store.rows("SELECT e.id FROM episode e JOIN cx_episode c ON c.id=e.id WHERE e.outcome='proposed' AND c.expires_at<=?",(self.store.clock(),)):
+                self.store.settle(r['id'],'expired',('proposed',),'approval window passed')
 
     def _advisor(self,stage,state,questions,allowed=False):
         answer=self.intent.evaluate(stage,state,questions,disclosure_allowed=bool(allowed and self.store.policy.cloud_enabled))
@@ -95,13 +123,15 @@ class Brain:
         return answer
 
     def command(self,request: str,*,principal: str,idempotency_key: str | None=None,cloud_allowed: bool=False) -> dict:
+        stops=self._stop_requests     # when this request began: a STOP after it revokes what it proposes
         principal=text(principal,'principal',100)
         if isinstance(request,str) and not request.strip():  # nothing was heard: misheard, before routing or planning
             return taken({'kind':'proposal','status':'refused','reason':"I didn't catch anything."},'misheard')
         request=text(request,'request',2000)
         with self.activity.foreground():
             low=normalize(request)
-            if low in {'stop','stop now','halt','emergency stop'}: return taken({'kind':'stop',**self.stop()},'understood')
+            # A stop wins before anything else, with the same vocabulary as the brain and the console (STOP_WORDS).
+            if STOP_WORDS.search(request): return taken({'kind':'stop',**self.stop()},'understood')
             # Cheap deterministic controls/recall precede optional cloud classification.
             if RECALL.search(request):
                 return taken(self.store.recall(request,principal=principal),'understood')
@@ -128,15 +158,20 @@ class Brain:
             except CortexError as e: return taken({'kind':'proposal','status':'refused','reason':str(e),'code':e.code},refusal_taken(request,e))
             alias_source=self.store.one("SELECT g.source_id FROM cx_goal g JOIN cx_source s ON s.source_id=g.source_id WHERE g.name=? AND s.status='accepted'",(normalize(request),))
             alias_refs=['source:'+alias_source['source_id']] if alias_source else []
-            return taken({'kind':'proposal',**self.propose(goal,request,principal=principal,idempotency_key=idempotency_key,extra_refs=alias_refs,cloud_allowed=cloud_allowed)},'understood')
+            return taken({'kind':'proposal',**self.propose(goal,request,principal=principal,idempotency_key=idempotency_key,extra_refs=alias_refs,
+                                                           cloud_allowed=cloud_allowed,stops=stops)},'understood')
 
     def propose(self,goal: Goal,request: str,*,principal: str,idempotency_key: str | None=None,
-                extra_refs: list[str] | None=None,cloud_allowed: bool=False,wake: tuple | None=None) -> dict:
+                extra_refs: list[str] | None=None,cloud_allowed: bool=False,wake: tuple | None=None,stops: int | None=None) -> dict:
+        stops=self._stop_requests if stops is None else stops
         goal=Goal.from_dict(goal.to_dict()); principal=text(principal,'principal',100)
         if safety_reason(request): raise Denied(safety_reason(request))
         request=text(request,'request',2000)
         ih=digest({'goal':goal.to_dict(),'request':request,'principal':principal,'extra_refs':extra_refs or []})
         key=principal+':'+text(idempotency_key,'idempotency key',200) if idempotency_key else None
+        # One world for the whole proposal, the one it is planned, checked and published against; a claw primitive
+        # handles what the claw holds in it (Compiler.held), and that object's rules are part of its basis.
+        fixture=self._fixture(); held=Compiler.held(goal,fixture)
         with self.store.tx():
             ep=None
             if key:
@@ -147,28 +182,32 @@ class Brain:
                         if wake: self._link(prior['id'],wake)
                         return self.operation(prior['id'])
                     ep=prior['id']; self._recoverable_preparing.remove(ep)
-            t=self.store.clock(); basis=self.store.basis(goal)
+            t=self.store.clock(); basis=self.store.basis(goal,held)
             if ep is None:
                 ep=uid('ep')
                 self.store.conn.execute('INSERT INTO episode(id,goal,request,outcome,started_at) VALUES(?,?,?,?,?)',
                                         (ep,canonical(goal.to_dict()),request,'preparing',t))
                 self.store.conn.execute('INSERT INTO cx_episode VALUES(?,?,?,?,?,?,?,?,?,?)',
-                    (ep,self.mode,canonical(goal.to_dict()),basis,self.store.policy.fingerprint(),canonical(self._fixture()),key,ih,t+self.store.policy.approval_ttl_s,principal))
+                    (ep,self.mode,canonical(goal.to_dict()),basis,self.store.policy.fingerprint(),canonical(fixture),key,ih,t+self.store.policy.approval_ttl_s,principal))
+                # Where the request came from (a task alias's or a commitment's source), kept from the start: deleting that
+                # source finds this episode even when planning failed before any plan cited it.
+                for ref in extra_refs or []:
+                    if ref.startswith('source:'): self.store.conn.execute('INSERT OR IGNORE INTO cx_episode_source VALUES(?,?)',(ep,ref[len('source:'):]))
             else:
                 self.store.conn.execute('UPDATE cx_episode SET basis_hash=?,initial_json=?,expires_at=? WHERE id=?',
-                    (basis,canonical(self._fixture()),t+self.store.policy.approval_ttl_s,ep))
+                    (basis,canonical(fixture),t+self.store.policy.approval_ttl_s,ep))
         with self.activity.foreground():
             try:
                 # A command is an episode, not a source: it is never recalled as knowledge.
-                refs=self.skills.provenance(goal,ep,extra_refs)
-                bundle=self.store.bundle(request,goal,principal=principal)
-                fixture=self._fixture()
+                refs=self.skills.provenance(goal,ep,extra_refs,principal=principal)
+                bundle=self.store.bundle(request,goal,principal=principal,held=held,episode=ep)
                 # Optional relevance advice ranks only explicitly cloud-permitted evidence.
                 shareable=[e for e in bundle['evidence'] if e.get('cloud_ok')]
                 if shareable:
                     self._advisor('relevance',{'request':request,'evidence':[{'id':e.get('id',e.get('chunk_id')),'text':e['text']} for e in shareable[:5]]},
                                   {'sufficient':'Does the supplied evidence directly support this request without missing a material condition?'},cloud_allowed)
-                skill=self.skills.find(goal)
+                # A procedure is the typed goal's: one for whatever the claw holds is composed afresh, never stored or reused.
+                skill=None if held else self.skills.find(goal,principal)     # only a procedure this principal may see
                 # A stored procedure is reused only where every step still makes progress; otherwise compose afresh.
                 if skill and not verify(goal,skill['definition']['steps'],fixture,self.store.related_rules(goal),self.store.policy).ok: skill=None
                 if skill and self.store.cloud_eligible(skill['definition']['refs']):
@@ -181,22 +220,19 @@ class Brain:
                 else:
                     plan=None
                     if self.qwen and self.qwen.planning_order=='model_first':
-                        try:
-                            calls+=1; out=self.qwen.complete('plan',bundle,goal=goal.to_dict())
-                            v=verify(goal,out.value['steps'],fixture,self.store.related_rules(goal),self.store.policy)
-                            self.store.decision('plan','llama.cpp',out.model,v.ok,'verified' if v.ok else 'goal verification rejected model plan')
-                            if v.ok:
-                                base=self.compiler.compile(goal,fixture)
-                                plan={**base,'steps':out.value['steps'],'refs':sorted(set(base['refs']+out.refs)),'verification':v.to_dict()}; source='model'
-                                self.store.manifest('last_qwen_request','parametric',{'contract_sha256':out.contract_hash,'prompt_sha256':out.prompt_hash,
-                                    'input_tokens':out.input_tokens,'model':out.model,'elapsed_ms':out.elapsed_ms,'response_accepted':True})
-                            else: note='Model plan failed independent goal verification; composed from accepted rules.'
-                        except CortexError as e:
-                            note='Local model unavailable or invalid: '+type(e).__name__
+                        calls+=1; plan,note=self._model_plan(goal,bundle,fixture)
+                        if plan: source='model'
                     if plan is None:
-                        plan=self.compiler.compile(goal,fixture); source='fallback' if calls else 'composed'
+                        try: plan=self.compiler.compile(goal,fixture); source='fallback' if calls else 'composed'
+                        except CompilerGap as gap:
+                            # Compiler first: a goal it cannot compose (its own plan fails the independent check, never a
+                            # refusal) goes to the local model, whose plan meets the same refusals and the same check.
+                            if not self.qwen or calls: raise
+                            calls+=1; plan,note=self._model_plan(goal,bundle,fixture)
+                            if plan is None: raise gap
+                            source='model'
                     plan['refs']=sorted(set(plan['refs']+refs))
-                    d=self.store.derive('task_recipe',{'task':goal.to_dict(),'steps':plan['steps'],'mode':'SIMULATED_VERIFICATION'},plan['refs'],
+                    d=self.store.derive('task_recipe',{'task':goal.to_dict(),'steps':plan['steps'],'mode':'SIMULATED_VERIFICATION'},self.skills.identity_refs(goal,plan['refs']),
                         origin='new_task_synthesis',verified=True,verifier='symbolic-verifier-v1',basis=plan['basis'])
                     derived_id=d['id']
                     # Re-read the newly acquired task recipe: it is the execution input,
@@ -209,21 +245,31 @@ class Brain:
                             {'unsupported':'Does this procedure add an effect not requested by the typed goal?','ambiguous':'Is the specified task materially ambiguous?'},cloud_allowed)
                         if advice['status']=='ok' and max(advice['scores'].values())>=0.8:
                             raise Missing('advisory review raised an unresolved mismatch; clarification required')
-                    candidate=self.skills.create(plan,mode='SIMULATED')
-                    tested=candidate['validation'] if candidate['status']=='APPROVED' else self.skills.test(candidate['id'],fixture)
-                    if tested['ok'] and candidate['status']!='APPROVED' and self.store.policy.auto_publish_verified:
-                        self.skills.approve(candidate['id'],candidate['digest'],principal='policy:'+self.store.policy.fingerprint(),automatic=True)
-                if self.store.basis(goal)!=basis: raise Stale('memory changed during planning')
+                    if not held:
+                        candidate=self.skills.create(plan,mode='SIMULATED')
+                        tested=candidate['validation'] if candidate['status']=='APPROVED' else self.skills.test(candidate['id'],fixture)
+                        if tested['ok'] and candidate['status']!='APPROVED' and self.store.policy.auto_publish_verified:
+                            self.skills.approve(candidate['id'],candidate['digest'],principal='policy:'+self.store.policy.fingerprint(),automatic=True)
                 plan['refs']=sorted(set(plan['refs']+refs))
-                checked=verify(goal,plan['steps'],fixture,self.store.related_rules(goal),self.store.policy,
-                               expected_basis=plan['basis'],actual_basis=self.store.basis(goal))
-                if not checked.ok or not self.store.refs_valid(plan['refs']): raise Stale('plan no longer satisfies current evidence')
                 plan_digest=digest({k:v for k,v in plan.items() if k!='verification'})
-                meta={'digest':plan_digest,'check':checked.to_dict(),'bundle':bundle,'source':source,'note':note,
-                      'derived_memory_id':derived_id,'targets':list(goal.targets),'zone':goal.zone,'mode':self.mode,'composition_calls':0 if skill else 1}
                 with self.store.tx():
-                    self.store.conn.execute("UPDATE episode SET outcome='proposed',plan_json=?,evidence_json=?,planner_calls=?,skill_id=? WHERE id=? AND outcome='preparing'",
-                        (canonical(plan),canonical(meta),calls,skill['id'] if skill else None,ep))
+                    # A STOP since the request began revokes it, as it revokes every pending proposal: one that came
+                    # before this episode existed is caught here, one after this check finds it proposed.
+                    if self._stop_requests!=stops:
+                        self.store.settle(ep,'cancelled',('preparing',),'stop revoked pending proposal')
+                    else:
+                        # The final checks run in the publishing transaction: a revocation lands before them (refused) or
+                        # after it (its invalidation finds the proposal), never in between.
+                        if self.store.basis(goal,held)!=basis: raise Stale('memory changed during planning')
+                        checked=verify(goal,plan['steps'],fixture,self.store.related_rules(goal,held),self.store.policy,
+                                       expected_basis=plan['basis'],actual_basis=self.store.basis(goal,held))
+                        if not checked.ok or not self.store.refs_valid(plan['refs']): raise Stale('plan no longer satisfies current evidence')
+                        changed=self._provenance_changed({'derived_memory_id':derived_id,'skill_id':skill['id'] if skill else None},plan)
+                        if changed: raise Stale(changed+' during planning')
+                        meta={'digest':plan_digest,'check':checked.to_dict(),'bundle':bundle,'source':source,'note':note,
+                              'derived_memory_id':derived_id,'targets':list(goal.targets),'zone':goal.zone,'mode':self.mode,'composition_calls':0 if skill else 1}
+                        self.store.conn.execute("UPDATE episode SET outcome='proposed',plan_json=?,evidence_json=?,planner_calls=?,skill_id=? WHERE id=? AND outcome='preparing'",
+                            (canonical(plan),canonical(meta),calls,skill['id'] if skill else None,ep))
                     # A woken proposal becomes approvable only already linked to its commitment.
                     if wake: self._link(ep,wake)
                 return self.operation(ep)
@@ -231,6 +277,23 @@ class Brain:
                 with self.store.tx(): self.store.conn.execute("UPDATE episode SET outcome='rejected',failure=?,finished_at=? WHERE id=? AND outcome='preparing'",(str(e)[:500] if isinstance(e,CortexError) else type(e).__name__,self.store.clock(),ep))
                 if isinstance(e,CortexError): raise
                 raise CortexError('planning failed: '+type(e).__name__) from None
+
+    def _model_plan(self, goal: Goal, bundle: dict, fixture: dict) -> tuple[dict | None, str]:
+        """The local model's plan for this goal, held to the compiler's refusals and its independent check: (plan, '')
+        or (None, why not) when the model is unavailable or invalid, or its plan is rejected."""
+        try: out=self.qwen.complete('plan',bundle,goal=goal.to_dict())
+        except CortexError as e: return None,'Local model unavailable or invalid: '+type(e).__name__
+        try: plan=self.compiler.compile(goal,fixture,steps=out.value['steps'])
+        except CortexError as e:
+            self.store.decision('plan','llama.cpp',out.model,False,'goal verification rejected model plan' if type(e) is Conflict else 'model plan refused: '+type(e).__name__)
+            return None,'Model plan failed independent goal verification; composed from accepted rules.'
+        self.store.decision('plan','llama.cpp',out.model,True,'verified')
+        self.store.manifest('last_qwen_request','parametric',{'contract_sha256':out.contract_hash,'prompt_sha256':out.prompt_hash,
+            'input_tokens':out.input_tokens,'model':out.model,'elapsed_ms':out.elapsed_ms,'response_accepted':True})
+        # The plan rests on everything the model was shown, cited or not: every source, rule, derived memory and episode
+        # in the exact context it was given (as QwenClient builds it), whatever the model's own citations.
+        plan['refs']=sorted(set(plan['refs'])|set(out.refs)|set(prompt_refs(model_context(bundle))))
+        return plan,''
 
     def _fixture(self) -> dict:
         """The verification world: current observations plus what the adapter reports in the claw (absent = unknown)."""
@@ -250,16 +313,16 @@ class Brain:
                 'skill_id':r['skill_id'],'derived_memory_id':m.get('derived_memory_id')}
 
     def pending(self):
-        with self.store.tx():
-            self.store.conn.execute("UPDATE episode SET outcome='expired' WHERE outcome='proposed' AND id IN (SELECT id FROM cx_episode WHERE expires_at<=?)",(self.store.clock(),))
+        self._expire()
         with self.store.tx():
             for r in self.store.rows("SELECT id,outcome FROM episode WHERE outcome IN ('expired','invalidated')"):self.store.finish_task(r['id'],r['outcome'])
         return [self.operation(r['id']) for r in self.store.rows("SELECT id FROM episode WHERE outcome='proposed' AND id IN (SELECT id FROM cx_episode) ORDER BY started_at DESC")]
 
-    def journal(self,ep: str | None,op: str,args: dict,status: str,detail: str='',step: int=0):
+    def journal(self,ep: str | None,op: str,args: dict,status: str,detail: str='',step: int=0,*,owner: str | None=None):
         with self.store.tx():
-            self.store.conn.execute('INSERT INTO operation_event(operation_id,episode_id,op,args_json,status,detail,at) VALUES(?,?,?,?,?,?,?)',
-                (f'{ep or "system"}:{step}',ep,op,canonical(args),status,detail[:1000],self.store.clock()))
+            seq=self.store.conn.execute('INSERT INTO operation_event(operation_id,episode_id,op,args_json,status,detail,at) VALUES(?,?,?,?,?,?,?)',
+                (f'{ep or "system"}:{step}',ep,op,canonical(args),status,detail[:1000],self.store.clock())).lastrowid
+            if owner: self.store.conn.execute('INSERT INTO cx_event_owner VALUES(?,?)',(seq,owner))
 
     def approve(self,ep: str, supplied_digest: str,*,principal: str) -> dict:
         text(principal,'authenticated approver',100)
@@ -270,59 +333,103 @@ class Brain:
                     r=self.operation(ep); plan=r['plan']
                     if r['owner']!=principal: raise Denied('approver does not own this operation')
                     if r['status']!='proposed': raise Conflict('operation is not awaiting approval')
-                    if self._stopped.is_set() or self.robot.state().get('stopped'): raise Denied('stop is latched')
+                    # The durable latch is the authority; the event and the adapter flag are faster copies of it. An adapter
+                    # that does not report its stop state as an explicit False may be stopped: no motion either.
+                    adapter=self.robot.state().get('stopped')
+                    if self._stopped.is_set() or adapter or self.store.one("SELECT 1 FROM meta WHERE key='cortex_stop'"): raise Denied('stop is latched')
+                    if adapter is not False: raise Denied('the adapter does not report its stop state; motion is refused')
                     self._require_reconciled('new motion')
                     if self.store.clock()>=r['expires_at']: raise Stale('proposal expired')
                     actual=digest({k:v for k,v in plan.items() if k!='verification'})
                     if supplied_digest!=actual or supplied_digest!=r['digest']: raise Conflict('approval does not match this exact plan')
                     goal=Goal.from_dict(plan['goal'])
-                    if r['derived_memory_id']:
-                        recipe=self.store.derived(r['derived_memory_id'])
-                        if recipe['status']!='VERIFIED' or recipe['payload'].get('steps')!=plan['steps'] or not self.store.refs_valid(recipe['refs']):
-                            raise Stale('execution recipe changed or lost its evidence')
-                    if r['skill_id']:
-                        skill=self.store.one('SELECT status,definition_json FROM skill_version WHERE id=?',(r['skill_id'],))
-                        if not skill or skill['status']!='APPROVED' or json.loads(skill['definition_json']).get('steps')!=plan['steps']:
-                            raise Stale('procedure was revoked or changed after proposal')
-                    if plan['basis']!=self.store.basis(goal) or plan['policy_hash']!=self.store.policy.fingerprint() or not self.store.refs_valid(plan['refs']):
+                    # The live world decides too: what the claw holds now is what a claw primitive handles, with its rules
+                    # and constraints, and it must be exactly what the plan was made and approved for.
+                    world=self._fixture(); held=Compiler.held(goal,world)
+                    if sorted(held)!=plan.get('held',[]): raise Stale('the claw holds something else than when this was proposed')
+                    rules=self.store.related_rules(goal,held)
+                    changed=self._provenance_changed(r,plan)
+                    if changed: raise Stale(changed+' after proposal')
+                    if plan['basis']!=self.store.basis(goal,held) or plan['policy_hash']!=self.store.policy.fingerprint() or not self.store.refs_valid(plan['refs']):
                         raise Stale('rule, binding, source or policy changed after proposal')
-                    if self.store.prohibitions(set(goal.targets)|{r['object'] for r in self.store.related_rules(goal)}) and goal.kind=='fetch': raise Denied('current prohibition blocks this operation')
-                    v=verify(goal,plan['steps'],self._fixture(),self.store.related_rules(goal),self.store.policy)
+                    if self.store.prohibitions(set(goal.targets)|{x['object'] for x in rules}) and goal.kind=='fetch': raise Denied('current prohibition blocks this operation')
+                    try: self.compiler.refuse(goal,world,rules)
+                    except CortexError as e: raise Denied(str(e)) from None
+                    v=verify(goal,plan['steps'],world,rules,self.store.policy)
                     if not v.ok: raise Denied('; '.join(v.errors))
                     claimed=self.store.conn.execute("UPDATE episode SET outcome='running' WHERE id=? AND outcome='proposed'",(ep,)).rowcount
                     if claimed!=1: raise Conflict('operation already claimed')
                     now=self.store.clock()
                     self.store.conn.execute('INSERT INTO approval VALUES(?,?,?,?,?,?,?,?)',(uid('apv'),'plan',ep,actual,principal,now,r['expires_at'],now))
-                return self._execute(ep,goal,plan)
+                # What the claw held when this was approved, empty included (unreported: never matches a live report).
+                return self._execute(ep,goal,plan,claw=world['holding'] if world.get('holding_known') else UNREPORTED)
         finally: self._effect_lock.release()
 
-    def _execute(self,ep: str,goal: Goal,plan: dict) -> dict:
+    def _prerequisites_observed(self,goal: Goal,oid: str,held: frozenset) -> None:
+        """Each prerequisite of an object about to be handled is currently observed at its required station."""
+        objects={o['id']:o for o in self.store.objects()}
+        for rule in self.store.related_rules(goal,held):
+            if rule['subject']==oid:
+                obj=objects.get(rule['object'])
+                if not obj or not obj['fresh'] or obj['last_zone']!=rule['required_zone']:
+                    raise Missing('prerequisite not currently observed at required station')
+
+    def _provenance_changed(self,r: dict,plan: dict) -> str | None:
+        """Why the recipe or approved skill a plan came from no longer backs it (None while it does). Checked at
+        approval and again before every dispatched step."""
+        if r['derived_memory_id']:
+            recipe=self.store.derived(r['derived_memory_id'])
+            if recipe['status']!='VERIFIED' or recipe['payload'].get('steps')!=plan['steps'] or not self.store.refs_valid(recipe['refs']):
+                return 'execution recipe changed or lost its evidence'
+        if r['skill_id']:
+            skill=self.store.one('SELECT status,definition_json FROM skill_version WHERE id=?',(r['skill_id'],))
+            if not skill or skill['status']!='APPROVED' or json.loads(skill['definition_json']).get('steps')!=plan['steps']:
+                return 'procedure was revoked or changed'
+        return None
+
+    def _execute(self,ep: str,goal: Goal,plan: dict,*,claw) -> dict:
         steps=[]; outcome='success'; reason=None; seen=set(); tags={o['tag']:o['id'] for o in self.store.objects()}; moved=False
+        op=self.operation(ep); held=frozenset(plan.get('held',[]))
+        expected=claw       # what the claw must hold before the next step: as approved, then after the plan's own effects
         try:
             for i,s in enumerate(plan['steps']):
-                if self._stopped.is_set(): outcome='aborted'; reason='stop requested'; break
-                if self.store.basis(goal)!=plan['basis'] or not self.store.refs_valid(plan['refs']):
-                    raise Stale('evidence changed while executing')
-                validate_step(s,set(tags.values()),self.store.zones())
-                # Observe/location steps must actually return a current observation before picking.
-                if s['op']=='pick_tagged_object':
-                    oid=s['args']['object_id']
-                    if oid not in seen: raise Missing('no fresh in-operation observation for pickup')
-                    for rule in self.store.related_rules(goal):
-                        if rule['subject']==oid:
-                            obj=next(o for o in self.store.objects() if o['id']==rule['object'])
-                            if not obj['fresh'] or obj['last_zone']!=rule['required_zone']:
-                                raise Missing('prerequisite not currently observed at required station')
-                self.journal(ep,s['op'],s['args'],'pending',step=i)
-                # STOP interlock: the last check sits immediately before dispatch (no validation or I/O in between),
-                # and the adapter refuses motion once stop() reached it, so a STOP in this gap cannot dispatch the step.
-                if self._stopped.is_set():
-                    self.journal(ep,s['op'],s['args'],'not_dispatched','stop arrived before dispatch',i); outcome='aborted'; reason='stop requested'; break
-                moved=moved or s['op'] in PHYSICAL
-                try: result=self.robot.execute(s['op'],s['args'])
-                except Exception:
-                    self.journal(ep,s['op'],s['args'],'unknown','adapter exception; no automatic retry',i)
-                    outcome='unknown'; reason='adapter exception after possible effect'; break
+                # From its first check through its dispatch a step holds the vault's authority: a revocation, a new
+                # constraint or a changed binding never commits in between. It waits for the dispatched step, and the
+                # next step's check sees it.
+                with self.store.held_authority():
+                    if self._stopped.is_set(): outcome='aborted'; reason='stop requested'; break
+                    if self.store.basis(goal,held)!=plan['basis'] or not self.store.refs_valid(plan['refs']):
+                        raise Stale('evidence changed while executing')
+                    if self._purged(ep): raise Stale('a source this operation was built from was deleted while it ran')
+                    validate_step(s,set(tags.values()),self.store.zones())
+                    # Handling an object needs its prerequisites observed at their stations now: a pickup's target (itself
+                    # observed in this operation), and for a claw step what the claw holds, still exactly the approved object.
+                    if s['op']=='pick_tagged_object':
+                        oid=s['args']['object_id']
+                        if oid not in seen: raise Missing('no fresh in-operation observation for pickup')
+                        self._prerequisites_observed(goal,oid,held)
+                    elif s['op'] in CLAW and held:
+                        for oid in held: self._prerequisites_observed(goal,oid,held)
+                    # A step that carries, needs, puts down or grips what the claw holds dispatches only while the claw
+                    # holds exactly what the plan expects (empty included): one loaded or swapped since never travels,
+                    # is never picked over, put down or closed on unchecked.
+                    if s['op'] in CLAW_BOUND:
+                        live=self.robot.state()
+                        if 'holding' not in live or live['holding']!=expected:
+                            raise Stale('the claw does not hold what this step expects (as approved, or as the plan left it)')
+                    self._record(ep,s['op'],s['args'],'pending',step=i)
+                    # The recipe or skill behind this plan must still back it at every step: a revocation mid-run stops it.
+                    changed=self._provenance_changed(op,plan)
+                    if changed: raise Stale(changed+' while executing')
+                    # STOP interlock: the last check sits immediately before dispatch (no validation or I/O in between),
+                    # and the adapter refuses motion once stop() reached it, so a STOP in this gap cannot dispatch the step.
+                    if self._stopped.is_set():
+                        self._record(ep,s['op'],s['args'],'not_dispatched','stop arrived before dispatch',i); outcome='aborted'; reason='stop requested'; break
+                    moved=moved or s['op'] in PHYSICAL
+                    try: result=self.robot.execute(s['op'],s['args'])
+                    except Exception:
+                        self._record(ep,s['op'],s['args'],'unknown','adapter exception; no automatic retry',i)
+                        outcome='unknown'; reason='adapter exception after possible effect'; break
                 for oid,proof in getattr(result,'location_evidence',{}).items():
                     current=next((x for x in self.store.objects() if x['id']==oid),None)
                     if current and current['fresh'] and current['last_observation_id']==proof.get('observation_id') and current['last_seen_at']==proof.get('captured_at') and current['last_zone']==proof.get('zone'):
@@ -333,9 +440,11 @@ class Brain:
                         self.store.observe(oid,zone,origin='robot_adapter',mode=self.mode,evidence=f'{ep}:{i}')
                         seen.add(oid)
                 reported=str(getattr(result,'status','unknown'))
-                self.journal(ep,s['op'],s['args'],'reported_done' if reported=='done' else reported,getattr(result,'detail',''),i)
+                self._record(ep,s['op'],s['args'],'reported_done' if reported=='done' else reported,getattr(result,'detail',''),i)
                 steps.append({**s,'status':reported,'detail':getattr(result,'detail','')})
                 if reported!='done': outcome='unknown' if reported not in {'failed','rejected'} else 'failed'; reason='adapter outcome: '+reported; break
+                if s['op']=='pick_tagged_object': expected=s['args']['object_id']
+                elif s['op'] in ('place_at_zone','gripper_open'): expected=None
             if outcome=='success':
                 if self.mode=='SIMULATED':
                     state=self.robot.state()
@@ -361,8 +470,23 @@ class Brain:
             except Exception: reason=(reason or '')+'; stop not confirmed'
         with self.store.tx():
             if outcome in {'unknown','aborted','failed'}: self._latch(f'{ep} ended {outcome}')
-            self.store.settle(ep,outcome,('running',),reason)
+            # Its reason may echo the source (an adapter's own words): never written for an episode purged meanwhile.
+            self.store.settle(ep,outcome,('running',),'[deleted]' if reason and self._purged(ep) else reason)
         return {**self.operation(ep),'steps':steps}
+
+    def _purged(self,ep: str) -> bool:
+        """Whether a deleted source purged this episode meanwhile (Store._purge_episodes: its plan gone)."""
+        r=self.store.one('SELECT plan_json FROM episode WHERE id=?',(ep,))
+        return not r or r['plan_json'] is None
+
+    def _record(self,ep: str,op: str,args: dict,status: str,detail: str='',step: int=0):
+        """Journal a step of an operation, its free text only while no deleted source purged the episode: the check and
+        the write are one transaction, so a deletion lands before both or after both and its redaction is never undone."""
+        with self.store.tx():
+            if self._purged(ep):
+                args,detail={'redacted':True},('[deleted]' if detail else '')
+                if status not in JOURNAL_STATES: status='[deleted]'
+            self.journal(ep,op,args,status,detail,step)
 
     def verify_outcome(self,ep: str,*,principal: str,ok: bool,note: str):
         note=text(note,'verification evidence',1000); outcome='success' if ok else 'failed'
@@ -380,32 +504,61 @@ class Brain:
         return self.operation(ep)
 
     def stop(self):
-        self._stopped.set(); self.activity.touch(); confirmed=False
-        # Durable first: a crash during the robot call still leaves the latch set and every pending proposal revoked.
+        # The physical STOP goes out first, on a path that takes no store lock and no lock the planner holds: a held
+        # transaction or stalled storage never delays it for an action already dispatched (the adapter latches it too).
+        # The in-memory latch is set before it, so nothing new is dispatched; the durable latch follows, even when the
+        # robot call itself failed or ended the process's call (re-raised once the latch is stored). If storing fails,
+        # the robot stays stopped, the in-memory latch stays set, and the storage error reaches the caller.
+        self._stop_gen+=1; self._stop_requests+=1; self._stopped.set(); sent=False; crash=None
+        try: self.robot.stop(); sent=True
+        except Exception: pass
+        except BaseException as e: crash=e
+        self.activity.touch()
         with self.store.tx():
             self._latch('operator stop')
             for r in self.store.rows("SELECT id FROM episode WHERE outcome IN ('preparing','proposed') AND id IN (SELECT id FROM cx_episode)"):
                 self.store.settle(r['id'],'cancelled',('preparing','proposed'),'stop revoked pending proposal')
-        try:
-            self.robot.stop(); confirmed=bool(self.robot.state().get('stopped'))
-        except Exception: pass
+        if crash is not None: raise crash
+        try: confirmed=sent and bool(self.robot.state().get('stopped'))
+        except Exception: confirmed=False
         self.journal(None,'stop',{},'confirmed' if confirmed else 'requested')
         return {'stop_requested':True,'stop_confirmed':confirmed,'auto_resume':False}
 
     def clear_stop(self,*,principal: str):
-        principal=text(principal,'operator',100)
-        with self.store.tx():
-            self._require_reconciled('rearming')
-            self.robot.reset_stop()
-            self.store.conn.execute("DELETE FROM meta WHERE key='cortex_stop'")
-            self.journal(None,'clear_stop',{},'cleared',principal)
-            self._stopped.clear()
+        principal=text(principal,'operator',100); gen=self._stop_gen
+        self._require_reconciled('rearming')
+        # The durable latch stays until the adapter confirmed the reset. A reset that fails or times out (perhaps after
+        # the adapter re-armed) or that the adapter does not report leaves the vault latched, so a restart still refuses
+        # motion, and the robot is stopped again. Motion stays refused meanwhile: approval reads the latch and the event.
+        try:
+            self.robot.reset_stop(); s=self.robot.state().get('stopped')                  # only an explicit False confirms it
+            why=None if s is False else 'it still reports stopped' if s else 'it does not report its stop state'
+        except Exception as e: why=type(e).__name__
+        if why:
+            self._restop(); raise Conflict(f'the adapter did not confirm the reset ({why}); the robot stays stopped and the stop stays latched')
+        # Then the latch is cleared in one transaction. A refused COMMIT, or a stop or failure latch that arrived
+        # meanwhile, wins: the robot is stopped again and nothing is cleared.
+        try:
+            with self.store.tx():
+                if self._stop_gen!=gen: raise Conflict('a stop arrived while the latch was being cleared; the robot stays stopped')
+                self._require_reconciled('rearming')
+                self.store.conn.execute("DELETE FROM meta WHERE key='cortex_stop'")
+                self.journal(None,'clear_stop',{},'cleared',principal,owner=principal)
+        except BaseException:
+            self._restop(); raise
+        self._stopped.clear()
+        if self._stop_gen!=gen: self._stopped.set()          # a stop landing after the commit keeps the event set as well
         self.activity.touch()
         return self.robot.state()
 
+    def _restop(self):
+        self._stopped.set()
+        try: self.robot.stop()
+        except Exception: pass
+
     def _latch(self,reason: str):
         # The stop latch is durable: recover() restores it, so a restart cannot silently re-arm motion.
-        self._stopped.set()
+        self._stop_gen+=1; self._stopped.set()
         with self.store.tx(): self.store.conn.execute("INSERT OR IGNORE INTO meta VALUES('cortex_stop',?)",(canonical({'at':self.store.clock(),'reason':reason}),))
 
     def _require_reconciled(self,action: str):
@@ -468,7 +621,7 @@ class Brain:
             last=self.store.one("SELECT value FROM meta WHERE key='cortex_last_utc'"); prior=float(last['value']) if last else None
             self.store.conn.execute("INSERT INTO meta VALUES('cortex_last_utc',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(now),))
             self.store.conn.execute("DELETE FROM meta WHERE key='cortex_clock_hold'")
-            self.journal(None,'clock_reestablished',{'previous_utc':prior,'utc':now},'confirmed',principal+': '+note)
+            self.journal(None,'clock_reestablished',{'previous_utc':prior,'utc':now},'confirmed',principal+': '+note,owner=principal)
         return {'utc':now,'previous_utc':prior,'reestablished_by':principal}
 
     def cancel_task(self,tid: str,*,principal: str) -> dict:
@@ -476,7 +629,8 @@ class Brain:
             r=self.store.one('SELECT p.*,c.owner FROM prospective_task p JOIN cx_commitment c ON c.id=p.id WHERE p.id=?',(tid,))
             if not r: raise Missing('task not found')
             if r['owner']!=principal: raise Denied('not the task owner')
-            if r['status']=='done': raise Conflict('cannot cancel an already completed task')
+            # Only an open commitment is withdrawn: a settled one (done, failed, expired, unknown, cancelled) keeps its outcome.
+            if r['status'] not in ('waiting','fired'): raise Conflict(f"cannot cancel a {r['status']} task: its outcome stands")
             if not self.store.withdraw_commitment(tid,'commitment cancelled'):
                 raise Conflict('effect may have started; stop/reconcile it, do not claim cancellation')
         return {'task_id':tid,'status':'cancelled'}
@@ -536,8 +690,9 @@ class Brain:
         self.store.finish_task(ep,self.store.one('SELECT outcome FROM episode WHERE id=?',(ep,))['outcome'])
         return True
 
-    def metrics(self):
-        return {'episodes':self.store.rows('SELECT id,outcome,planner_calls,skill_id FROM episode ORDER BY started_at'),
+    def metrics(self,principal: str | None=None):
+        # Episode records are the principal's own only, as operation reads and /events show them; with no principal, none.
+        return {'episodes':self.store.rows('SELECT e.id,e.outcome,e.planner_calls,e.skill_id FROM episode e JOIN cx_episode c ON c.id=e.id WHERE c.owner=? ORDER BY e.started_at',(principal,)),
                 'derived':self.store.rows('SELECT kind,status,COUNT(*) n FROM cx_derived GROUP BY kind,status'),
                 'skills':self.store.rows('SELECT status,COUNT(*) n FROM skill_version GROUP BY status'),
                 'practice':self.store.rows('SELECT status,COUNT(*) n FROM cx_practice GROUP BY status'),

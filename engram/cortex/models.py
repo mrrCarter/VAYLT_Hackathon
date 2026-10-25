@@ -7,14 +7,18 @@ x86, slower on the Pi (~50 s for a tiny prompt). Hence: the local timeout defaul
 120 s; planning is compiler-first (CORTEX_PLANNING_ORDER=model_first is an explicit
 experiment); and an abandoned local request keeps the single local slot until
 llama-server actually answers, so the next call falls back at once instead of stacking.
+An idle (background) call yields instead: a foreground call closes its request and takes the slot.
 """
 from __future__ import annotations
 
 import collections
 import hashlib
+import http.client
+import inspect
 import json
 import os
 import queue
+import socket
 import threading
 import time
 import urllib.error
@@ -46,13 +50,23 @@ def _wire(payload: dict) -> bytes:
     return json.dumps(payload,separators=(',',':'),ensure_ascii=False,allow_nan=False).encode()
 
 
+# The live HTTP connection of each request, by the worker thread that opened it: preempting it closes its socket.
+_LIVE={}
+
+class _Tracked(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        def connect(host, **kw):
+            conn=http.client.HTTPConnection(host,**kw); _LIVE[threading.get_ident()]=conn; return conn
+        return self.do_open(connect,req)
+
+
 def _request_json_blocking(url: str, payload: dict, headers: dict, timeout: float) -> dict:
     raw=_wire(payload)
     if len(raw)>128000: raise ModelUnavailable('model request too large')
     req=urllib.request.Request(url,data=raw,headers={'Content-Type':'application/json',**headers},method='POST')
     try:
         # No environment proxy: memory text must never leave through HTTP(S)_PROXY.
-        opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
+        opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect(),_Tracked())
         with opener.open(req,timeout=timeout) as response:
             body=response.read(256001)
             if len(body)>256000: raise ModelUnavailable('model response too large')
@@ -65,6 +79,8 @@ def _request_json_blocking(url: str, payload: dict, headers: dict, timeout: floa
     except Exception as e:
         # Do not embed response bodies, request headers, source content, or secrets.
         raise ModelUnavailable('model request failed: '+type(e).__name__) from None
+    finally:
+        _LIVE.pop(threading.get_ident(),None)
 
 
 def _is_loopback(url: str) -> bool:
@@ -78,7 +94,10 @@ def _is_loopback(url: str) -> bool:
 # then fails fast instead of queueing behind (or poisoning) the abandoned one.
 _SLOTS={'local':threading.BoundedSemaphore(1),'cloud':threading.BoundedSemaphore(2)}
 LOCAL_DRAIN_S=600.0
-def request_json(url: str, payload: dict, headers: dict, timeout: float) -> dict:
+CANCEL_GRACE_S=2.0
+def request_json(url: str, payload: dict, headers: dict, timeout: float, *, cancel: threading.Event | None=None) -> dict:
+    """A set cancel event (a background call a foreground one preempts) closes the request's connection: its worker then
+    returns and frees the local slot for the foreground request, instead of holding it until the server answers."""
     timeout=finite(timeout,'HTTP deadline',.01,600)
     pool='local' if _is_loopback(url) else 'cloud'; slots=_SLOTS[pool]
     if not slots.acquire(blocking=False):
@@ -90,11 +109,33 @@ def request_json(url: str, payload: dict, headers: dict, timeout: float) -> dict
             except Exception as e: out=(False,e if isinstance(e,ModelUnavailable) else ModelUnavailable('model HTTP failed: '+type(e).__name__))
         finally: slots.release()
         result.put(out)
-    threading.Thread(target=worker,name='engram-bounded-http-'+pool,daemon=True).start()
-    try:ok,value=result.get(timeout=timeout)
-    except queue.Empty:raise ModelUnavailable('model HTTP wall-clock deadline exceeded') from None
+    t=threading.Thread(target=worker,name='engram-bounded-http-'+pool,daemon=True); t.start()
+    end=time.monotonic()+timeout
+    while True:
+        left=end-time.monotonic()
+        if left<=0: raise ModelUnavailable('model HTTP wall-clock deadline exceeded') from None
+        try: ok,value=result.get(timeout=min(left,.05) if cancel is not None else left); break
+        except queue.Empty:
+            if cancel is not None and cancel.is_set():
+                _abort(t,result); raise ModelUnavailable('model request preempted by a foreground request') from None
     if not ok:raise ModelUnavailable(str(value),http_status=value.http_status) from None
     return value
+
+
+def _abort(worker: threading.Thread, result: queue.Queue) -> None:
+    """Close a preempted request's socket until its worker has returned (and freed its slot), within a grace. A receive
+    blocked in another thread wakes on shutdown() on Linux and on closing the descriptor on Windows; the descriptor is
+    closed at the base level, past the reader's makefile() reference (which would defer socket.close()), and marked
+    closed there, so the worker's own later close is a no-op."""
+    end=time.monotonic()+CANCEL_GRACE_S
+    while time.monotonic()<end:
+        conn=_LIVE.get(worker.ident); sock=getattr(conn,'sock',None)
+        if sock is not None:
+            for close in (lambda: sock.shutdown(socket.SHUT_RDWR),lambda: super(socket.socket,sock).close()):
+                try: close()
+                except OSError: pass
+        try: result.get(timeout=.02); return
+        except queue.Empty: pass
 
 
 def validate_loopback(url: str) -> str:
@@ -207,6 +248,9 @@ class QwenClient:
                  timeout_s: float=120, input_budget: int=2048, output_budget: int=384,
                  transport: Callable=request_json, planning_order: str | None=None):
         self.endpoint=validate_loopback(endpoint)
+        # Plain http: an idle call a foreground one preempts is closed through its tracked socket (_Tracked), which an
+        # https request does not have here, so it would hold the local slot instead of yielding.
+        if urllib.parse.urlsplit(self.endpoint).scheme!='http': raise Denied('the local model endpoint must be plain http on loopback (an https call could not yield to an interactive one)')
         self.timeout_s=finite(timeout_s,'model timeout',0.1,600)
         if not 256<=input_budget<=8192 or not 32<=output_budget<=1024: raise CortexError('invalid model token budget')
         self.input_budget,self.output_budget=input_budget,output_budget
@@ -220,7 +264,12 @@ class QwenClient:
         if not self.contract.strip() or len(self.contract.encode())>10000: raise CortexError('missing/overlarge ENGRAM contract')
         self.contract_hash=hashlib.sha256(self.contract.encode()).hexdigest()
         self.transport=transport
-        self._lock=threading.Lock()
+        # One call at a time on the single local model slot. A background (idle) call is preemptible: _preempt is its
+        # cancel event, and _waiting counts foreground calls waiting for it to let go. A transport taking `cancel`
+        # (request_json does) also closes an in-flight request; any other is preempted between its requests.
+        self._lock=threading.Lock(); self._state=threading.Lock(); self._preempt=None; self._waiting=0
+        try: self._cancellable='cancel' in inspect.signature(transport).parameters
+        except (TypeError,ValueError): self._cancellable=False
         self.last_trace={}
 
     def manifest(self) -> dict:
@@ -230,10 +279,43 @@ class QwenClient:
                 'timeout_s':self.timeout_s,'planning_order':self.planning_order,
                 'inference_verified':False,'weight_training':False}
 
+    PREEMPT_WAIT_S=10.0      # how long a foreground call waits for a preempted background call to let go
+
+    def _enter(self, background: bool) -> threading.Event | None:
+        """Take the local model. A background call yields to foreground work: it never starts while a foreground call
+        runs or waits, and once one arrives its request is closed. A foreground call preempts a background one and waits
+        (bounded) for it to let go; against another foreground call, running or already waiting, it fails at once, never
+        stacking behind it."""
+        with self._state:
+            if background:
+                if self._waiting or not self._lock.acquire(blocking=False): raise ModelUnavailable('local model busy; a foreground request has priority')
+                self._preempt=threading.Event(); return self._preempt
+            # One already waiting goes first, even once the background call let go and before the waiter woke.
+            if self._waiting: raise ModelUnavailable('local model busy; another foreground request is already waiting')
+            if self._preempt is None:
+                if not self._lock.acquire(blocking=False): raise ModelUnavailable('local model busy; preserve interactive priority')
+                return None
+            self._preempt.set(); self._waiting+=1
+        try: got=self._lock.acquire(timeout=self.PREEMPT_WAIT_S)
+        finally:
+            with self._state: self._waiting-=1
+        if not got: raise ModelUnavailable('local model busy; the preempted background call did not let go')
+        return None
+
+    def _leave(self, background: bool) -> None:
+        with self._state:
+            if background: self._preempt=None
+            self._lock.release()
+
+    def _send(self, path: str, payload: dict, headers: dict, cancel: threading.Event | None) -> dict:
+        if cancel is not None and cancel.is_set(): raise ModelUnavailable('background model call preempted by a foreground request')
+        return self.transport(self.endpoint+path,payload,headers,self.timeout_s,**({'cancel':cancel} if cancel is not None and self._cancellable else {}))
+
     def complete(self, purpose: str, bundle: dict, *, goal: dict | None=None) -> ModelResult:
         if purpose not in {'plan','dream'}: raise CortexError('unsupported Qwen purpose')
         schema=plan_schema(goal,bundle) if purpose=='plan' else HYPOTHESIS_SCHEMA   # refused before any model request
-        if not self._lock.acquire(blocking=False): raise ModelUnavailable('local model busy; preserve interactive priority')
+        background=purpose=='dream'          # idle consolidation: it yields to an interactive plan
+        cancel=self._enter(background)
         start=time.perf_counter()
         trace=self.last_trace={'purpose':purpose,'stage':'template','http_status':None,'thinking_disabled':None,
                                'input_tokens':None,'stop_type':None,'truncated':None,'timings':None}
@@ -247,21 +329,21 @@ class QwenClient:
             messages=[{'role':'system','content':system},{'role':'user','content':prompt_data(state)}]
             if len(_wire(messages))>32000: raise Missing('prompt exceeds byte budget')
             headers={}
-            template=self.transport(self.endpoint+'/apply-template',{'messages':messages,'chat_template_kwargs':{'enable_thinking':False}},headers,self.timeout_s)
+            template=self._send('/apply-template',{'messages':messages,'chat_template_kwargs':{'enable_thinking':False}},headers,cancel)
             prompt=template.get('prompt')
             if not isinstance(prompt,str): raise ModelUnavailable('server did not return applied template')
             # Without --jinja, llama-server returns 200 but silently ignores enable_thinking.
             trace['thinking_disabled']=prompt.endswith(THINK_OFF)
             if not trace['thinking_disabled']: raise ModelUnavailable('chat template ignored thinking off; start llama-server with --jinja')
             trace['stage']='tokenize'
-            toks=self.transport(self.endpoint+'/tokenize',{'content':prompt,'add_special':False},headers,self.timeout_s).get('tokens')
+            toks=self._send('/tokenize',{'content':prompt,'add_special':False},headers,cancel).get('tokens')
             if not isinstance(toks,list) or any(not isinstance(t,(int,dict)) for t in toks): raise ModelUnavailable('token count unavailable')
             trace['input_tokens']=len(toks)
             if len(toks)>self.input_budget: raise Missing('mandatory memory does not fit Qwen context; no silent truncation')
             trace['stage']='completion'
             # Use the exact template whose tokens were counted, avoiding template drift.
-            response=self.transport(self.endpoint+'/completion',{'prompt':prompt,'n_predict':self.output_budget,'temperature':0,
-                         'json_schema':schema,'cache_prompt':True},headers,self.timeout_s)
+            response=self._send('/completion',{'prompt':prompt,'n_predict':self.output_budget,'temperature':0,
+                         'json_schema':schema,'cache_prompt':True},headers,cancel)
             trace.update(stop_type=response.get('stop_type'),truncated=response.get('truncated'),timings=response.get('timings'),stage='parse')
             content=response.get('content')
             if not isinstance(content,str): raise ModelUnavailable('missing model content')
@@ -279,7 +361,7 @@ class QwenClient:
             trace['http_status']=e.http_status; trace['error']=str(e)[:200]
             raise
         finally:
-            self._lock.release()
+            self._leave(background)
 
 
 class IntentAdvisor:
@@ -301,6 +383,7 @@ class IntentAdvisor:
         # The model id comes from the environment only: no default in code and no constructor override.
         self.model=os.environ.get('TYPESAFE_INTENT_MODEL','').strip()
         self.timeout=finite(timeout_s,'intent model timeout',0.1,15)
+        if isinstance(max_calls,bool) or not isinstance(max_calls,int) or not 0<=max_calls<=10000: raise CortexError('advisory call budget must be a whole number from 0')
         self.transport=transport; self.max_calls=max_calls; self.window_s=finite(window_s,'advisory rate window',1,86400)
         self.calls=0; self._recent=collections.deque(); self._clock=monotonic
         self._lock=threading.Lock(); self.last_result=None
@@ -315,8 +398,8 @@ class IntentAdvisor:
         with self._lock:
             now=self._clock()
             while self._recent and now-self._recent[0]>=self.window_s: self._recent.popleft()
-            if len(self._recent)>=self.max_calls:
-                return {'status':'budget_exhausted','stage':stage,'scores':{},'retry_after_s':round(self.window_s-(now-self._recent[0]),3)}
+            if len(self._recent)>=self.max_calls:     # a budget of zero has no call to wait for: no retry time
+                return {'status':'budget_exhausted','stage':stage,'scores':{},'retry_after_s':round(self.window_s-(now-self._recent[0]),3) if self._recent else None}
             self._recent.append(now); self.calls+=1
         start=time.perf_counter()
         try:

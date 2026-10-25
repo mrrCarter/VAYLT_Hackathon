@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS cx_station(id TEXT PRIMARY KEY,name TEXT NOT NULL,ali
 CREATE TABLE IF NOT EXISTS cx_goal(name TEXT PRIMARY KEY,goal_json TEXT NOT NULL,source_id TEXT NOT NULL REFERENCES source(id),version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_derived(id TEXT PRIMARY KEY,kind TEXT NOT NULL,status TEXT NOT NULL,payload_json TEXT NOT NULL,refs_json TEXT NOT NULL,basis_hash TEXT NOT NULL,fingerprint TEXT UNIQUE NOT NULL,origin TEXT NOT NULL,verifier TEXT,created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_episode(id TEXT PRIMARY KEY REFERENCES episode(id),mode TEXT NOT NULL,goal_json TEXT NOT NULL,basis_hash TEXT NOT NULL,policy_hash TEXT NOT NULL,initial_json TEXT NOT NULL,request_key TEXT UNIQUE,input_hash TEXT NOT NULL,expires_at REAL NOT NULL,owner TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cx_episode_source(episode_id TEXT NOT NULL REFERENCES episode(id),source_id TEXT NOT NULL REFERENCES source(id),PRIMARY KEY(episode_id,source_id));
 CREATE TABLE IF NOT EXISTS cx_skill(id TEXT PRIMARY KEY REFERENCES skill_version(id),goal_key TEXT NOT NULL,basis_hash TEXT NOT NULL,policy_hash TEXT NOT NULL,validation_json TEXT,mode TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS cx_skill_goal ON cx_skill(goal_key);
 CREATE TABLE IF NOT EXISTS cx_commitment(id TEXT PRIMARY KEY REFERENCES prospective_task(id),owner TEXT NOT NULL,generation INTEGER NOT NULL DEFAULT 1,expires_at REAL,source_revision INTEGER NOT NULL DEFAULT 1);
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS cx_due(task_id TEXT PRIMARY KEY REFERENCES prospectiv
 CREATE TABLE IF NOT EXISTS cx_consolidated(episode_id TEXT PRIMARY KEY REFERENCES episode(id),outcome TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_event(id TEXT PRIMARY KEY,trigger TEXT NOT NULL,payload_hash TEXT NOT NULL,origin TEXT NOT NULL,created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_wake(event_id TEXT NOT NULL REFERENCES cx_event(id),task_id TEXT NOT NULL REFERENCES prospective_task(id),generation INTEGER NOT NULL,status TEXT NOT NULL,proposal_id TEXT,error TEXT,PRIMARY KEY(event_id,task_id,generation));
+CREATE TABLE IF NOT EXISTS cx_event_owner(seq INTEGER PRIMARY KEY REFERENCES operation_event(seq),owner TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_decision(id TEXT PRIMARY KEY,stage TEXT NOT NULL,provider TEXT NOT NULL,model TEXT,accepted INTEGER NOT NULL,detail TEXT NOT NULL,created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_practice(id TEXT PRIMARY KEY,case_json TEXT NOT NULL,expected_json TEXT NOT NULL,actual_json TEXT NOT NULL,status TEXT NOT NULL,verifier TEXT NOT NULL,mode TEXT NOT NULL DEFAULT 'SIMULATED',created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_dream(id TEXT PRIMARY KEY,started_at REAL NOT NULL,finished_at REAL,status TEXT NOT NULL,summary_json TEXT NOT NULL);

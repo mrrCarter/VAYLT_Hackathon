@@ -103,10 +103,10 @@ def test_stop_revokes_pending_and_does_not_resume(brain):
     with pytest.raises(Conflict): approve(brain,p)
     assert not brain.robot.calls
 
-def test_physical_ack_requires_independent_observation(arena,clock):
+def test_physical_ack_requires_independent_observation(tmp_path,arena,clock):
     class PhysicalLike(FakeRobot):
         def state(self): return {**super().state(),'adapter':'test-physical'}
-    s=Store(policy=Policy(live_enabled=True),clock=clock); s.register_arena(arena)
+    s=Store(tmp_path/'live.db',policy=Policy(live_enabled=True),clock=clock); s.register_arena(arena)
     b=Brain(s,PhysicalLike(arena))
     p=b.command('Open the claw',principal='carther'); r=approve(b,p)
     assert r['status']=='needs_verification'
@@ -121,7 +121,7 @@ def test_physical_adapter_disabled_by_default(arena,store):
     with pytest.raises(Denied): Brain(store,PhysicalLike(arena))
 
 def test_symbolic_oracle_rejects_wrong_goal_and_extras(store):
-    g=Goal('fetch',('sample_a',),'bench'); c=Compiler(store); plan=c.compile(g); f=c.fixture()
+    g=Goal('fetch',('sample_a',),'bench'); c=Compiler(store); plan=c.compile(g); f=c.fixture(symbolic=True)
     assert verify(g,plan['steps'],f,[],store.policy).ok
     bad=copy.deepcopy(plan['steps']); bad[-1]['args']['zone']='shelf_b'
     assert not verify(g,bad,f,[],store.policy).ok
@@ -131,7 +131,7 @@ def test_symbolic_oracle_rejects_wrong_goal_and_extras(store):
 @pytest.mark.parametrize('value',[float('nan'),float('inf'),True,100,-100,'0.1'])
 def test_primitive_bounds_and_types(store,value):
     goal=Goal('primitive',primitive='drive_bounded',args={'distance_m':0.1})
-    assert not verify(goal,[{'op':'drive_bounded','args':{'distance_m':value}}],Compiler(store).fixture(),[],store.policy).ok
+    assert not verify(goal,[{'op':'drive_bounded','args':{'distance_m':value}}],Compiler(store).fixture(symbolic=True),[],store.policy).ok
 
 def test_new_derived_recipe_cannot_skip_real_observation(brain):
     p=propose(brain)
@@ -189,13 +189,19 @@ def test_a_request_the_advisor_finds_ambiguous_states_unclear(arena,clock):
 @pytest.mark.parametrize('utterance,cls',[
     ("Do not move Sample A to the bench.",'understood'),("Don't move sample A to bench.",'understood'),
     ("Don"+chr(0x2019)+"t move sample A to bench.",'understood'),("Never pick Sample A.",'understood'),
-    ("Dump Sample A in the trash.",'understood'),("Hold on, move Sample A to the bench.",'unclear'),
+    ("Dump Sample A in the trash.",'understood'),("Never mind, move Sample A to the bench.",'unclear'),
     ("Move sample A to bench tomorrow.",'unclear'),("Bring the gizmo to the bench.",'unclear')],
     ids=['do not','dont','a curly apostrophe','never','an action it may not do','a cancellation','tomorrow',
          'a word it does not know'])
 def test_a_clear_dont_or_a_refused_action_is_understood_and_the_rest_unclear(brain,utterance,cls):
     r=brain.command(utterance,principal='carther')
     assert (r['status'],r['classification'],r['needs_clarification'])==('refused',cls,cls!='understood'),r
+
+def test_a_cancellation_with_a_stop_word_in_it_is_a_stop_as_in_the_engine_and_the_console(brain):
+    # "hold on" is a stop word here as in the engine and the console parser (one pattern): it latches a stop.
+    r=brain.command('Hold on, move Sample A to the bench.',principal='carther')
+    assert (r['kind'],r['classification'],r['needs_clarification'])==('stop','understood',False),r
+    assert brain.robot.stopped and brain.store.one('SELECT COUNT(*) n FROM episode')['n']==0   # stopped; nothing proposed
 
 class Negating(Unsure):
     """An intent advisor that finds every request negated, and none ambiguous."""

@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse,FileResponse,Response,StreamingRespon
 from pydantic import BaseModel,ConfigDict,Field
 from .types import *
 from .store import Store
-from .runtime import Brain
+from .runtime import PUBLIC_EVENTS,Brain
 from .planning import CAPS,PHYSICAL,parse_goal,safety_reason
 from .models import IntentAdvisor,QwenClient
 from .simulation import FakeRobot
@@ -90,14 +90,21 @@ class Turn(Input):
 MAX_BODY=300000
 SAFE_METHODS={'GET','HEAD','OPTIONS'}
 SWEEP_S,SWEEP_MAX_S,REPEAT_S=1.0,60.0,600.0
+SHUTDOWN_WAIT_S=30.0   # how long shutdown waits for a sweep in flight; past it the store is left open, never closed under it
 log=logging.getLogger('engram.cortex.api')
 
-async def sweep_forever(b:Brain):
+async def sweep_forever(b:Brain,stopping:asyncio.Event|None=None):
     """Timed-task scheduler that never dies. Any failure (clock rollback, 'database is locked')
     is logged, retried with exponential backoff SWEEP_S..SWEEP_MAX_S, and recorded as a decision
-    once per REPEAT_S while the same failure repeats. Due tasks only ever become proposals."""
+    once per REPEAT_S while the same failure repeats. Due tasks only ever become proposals.
+    It stops cooperatively: `stopping` ends the loop between sweeps, never inside one (a sweep runs
+    in a worker thread that cancelling the await would leave running)."""
+    stopping=stopping or asyncio.Event()
+    async def pause(seconds):
+        try:await asyncio.wait_for(stopping.wait(),seconds)
+        except TimeoutError:pass
     delay,last,noted=SWEEP_S,None,0.0
-    while True:
+    while not stopping.is_set():
         try:await asyncio.to_thread(b.sweep_due);delay,last=SWEEP_S,None
         except Exception as e:
             code=e.code if isinstance(e,CortexError) else type(e).__name__
@@ -105,36 +112,50 @@ async def sweep_forever(b:Brain):
             if code!=last or time.monotonic()-noted>=REPEAT_S:
                 try:await asyncio.to_thread(b.store.decision,'clock_sweep','local',None,False,code);last,noted=code,time.monotonic()
                 except Exception:log.exception('could not record the sweep failure')
-            await asyncio.sleep(delay);delay=min(delay*2,SWEEP_MAX_S);continue
-        await asyncio.sleep(delay)
+            await pause(delay);delay=min(delay*2,SWEEP_MAX_S);continue
+        await pause(delay)
 
-async def stop_task(task):
-    task.cancel();await asyncio.gather(task,return_exceptions=True)
+async def stop_sweeping(task,stopping)->bool:
+    """Ask the sweeper to stop and wait for it, a sweep in flight included (up to SHUTDOWN_WAIT_S): True once it ended."""
+    stopping.set()
+    try:await asyncio.wait_for(asyncio.shield(task),SHUTDOWN_WAIT_S)
+    except TimeoutError:log.error('a timed-task sweep is still running after %.0f s',SHUTDOWN_WAIT_S);return False
+    return True
 
 class Guard:
-    """Outermost pure-ASGI gate. A cross-site or uncredentialed mutation is refused before ONE body
-    byte is read; every body is counted as it arrives (declared or chunked) and refused past MAX_BODY.
-    Route dependencies still decide operator versus sensor; this only checks that a credential exists."""
-    def __init__(self,app,*,credentials):self.app=app;self.credentials=[c.encode() for c in credentials]
+    """Outermost pure-ASGI gate. A cross-site mutation, or one without a credential of its route's role (a sensor
+    credential on a sensor route, an operator credential on every other), is refused before ONE body byte is read;
+    every body is counted as it arrives (declared or chunked) and refused past MAX_BODY. Route dependencies still
+    decide the principal; this only checks that a credential of the right role exists."""
+    def __init__(self,app,*,credentials,sensor_credentials=(),sensor_paths=frozenset()):
+        self.app=app;self.credentials=[c.encode() for c in credentials]
+        self.sensor_credentials=[c.encode() for c in sensor_credentials];self.sensor_paths=frozenset(sensor_paths)
     async def __call__(self,scope,receive,send):
         if scope['type']!='http':return await self.app(scope,receive,send)
         h={k.decode('latin-1').lower():v.decode('latin-1') for k,v in scope['headers']}
         if scope['method'] not in SAFE_METHODS:
             # Refuse cross-site browser mutations; serve through a paired same-origin TLS proxy.
             if h.get('sec-fetch-site')=='cross-site':return await refuse(send,403,'cross-site mutation refused')
-            auth=h.get('authorization','')
-            if not (auth.startswith('Bearer ') and any(hmac.compare_digest(auth[7:].encode(),c) for c in self.credentials)):
-                return await refuse(send,401,'operator credential required')
+            auth=h.get('authorization','');sensor=scope.get('path') in self.sensor_paths
+            role=self.sensor_credentials if sensor else self.credentials
+            if not (auth.startswith('Bearer ') and any(hmac.compare_digest(auth[7:].encode(),c) for c in role)):
+                return await refuse(send,401,'trusted sensor credential required' if sensor else 'operator credential required')
         try:declared=int(h.get('content-length','0'))
         except ValueError:return await refuse(send,400,'invalid length')
         if declared>MAX_BODY:return await refuse(send,413,'input too large')
-        body=b'';more=True
+        # A method that takes no body has none: one sent anyway (declared, or chunked and so of unknown size) is refused
+        # unread; one without is passed on, nothing of it read or buffered here.
+        if scope['method'] in SAFE_METHODS:
+            if declared>0 or 'transfer-encoding' in h:return await refuse(send,413,'a GET, HEAD or OPTIONS request takes no body')
+            return await self.app(scope,receive,send)
+        # Gathered into one growing buffer, never re-copied per chunk: a body in tiny chunks costs linear time.
+        body=bytearray();more=True
         while more:
             m=await receive()
             if m['type']!='http.request':return
             body+=m.get('body',b'');more=m.get('more_body',False)
             if len(body)>MAX_BODY:return await refuse(send,413,'input too large')
-        replayed=False
+        body=bytes(body);replayed=False
         async def replay():
             nonlocal replayed
             if replayed:return await receive()
@@ -182,13 +203,22 @@ def _configured_brain()->Brain:
     return Brain(s,robot,qwen=qwen,intent=IntentAdvisor(enabled=policy.cloud_enabled))
 
 
+def env_token() -> str:
+    """The operator token: read from CORTEX_API_TOKEN_FILE when set (so it never sits on a command line), else from
+    CORTEX_API_TOKEN."""
+    path=os.environ.get('CORTEX_API_TOKEN_FILE')
+    return Path(path).read_text(encoding='utf-8').strip() if path else os.environ.get('CORTEX_API_TOKEN','')
+
 def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:FrameHub|None=None,
-               start_idle:bool|None=None,sensor_tokens:dict[str,str]|None=None)->FastAPI:
+               start_idle:bool|None=None,sensor_tokens:dict[str,str]|None=None,admins:set[str]|None=None)->FastAPI:
     supplied=brain is not None
-    keys=tokens if tokens is not None else {os.environ.get('CORTEX_API_TOKEN',''):os.environ.get('CORTEX_OPERATOR','operator')}
+    # Operators who may revoke, delete or revise any operator's source: explicit, none by default (CORTEX_ADMINS).
+    admins=set(admins) if admins is not None else {p.strip() for p in os.environ.get('CORTEX_ADMINS','').split(',') if p.strip()}
+    keys=tokens if tokens is not None else {env_token():os.environ.get('CORTEX_OPERATOR','operator')}
     if not keys or any(len(k)<32 or not v.strip() for k,v in keys.items()):
         raise Denied('configure a random server-side CORTEX_API_TOKEN of at least 32 characters')
-    skeys=sensor_tokens or ({os.environ['CORTEX_SENSOR_TOKEN']:'sensor:camera'} if os.environ.get('CORTEX_SENSOR_TOKEN') else {})
+    # An explicit set, even an empty one (sensors disabled), is the caller's; only an absent one falls back to the environment.
+    skeys=sensor_tokens if sensor_tokens is not None else ({os.environ['CORTEX_SENSOR_TOKEN']:'sensor:camera'} if os.environ.get('CORTEX_SENSOR_TOKEN') else {})
     if any(len(k)<32 or not v.startswith('sensor:') or k in keys for k,v in skeys.items()):
         raise Denied('sensor credentials must be distinct, scoped and at least 32 characters')
     b=brain or _configured_brain()
@@ -199,11 +229,19 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     @asynccontextmanager
     async def lifespan(app):
         async with AsyncExitStack() as cleanup: # every registered step runs at shutdown, even if one raises
-            if not supplied:cleanup.callback(b.close)
+            sweeper=[]
+            def close_brain():
+                # Never under a sweep still running in its worker thread (stop_sweeping gave up waiting): the store
+                # stays open for it, and the process exit releases the vault.
+                if sweeper and not sweeper[0].done():log.error('the store is left open: a timed-task sweep still uses it');return
+                b.close()
+            if not supplied:cleanup.callback(close_brain)
             cleanup.callback(b.dreamer.stop)
             # Reconcile durable wakes into proposals only; never resume a physical effect.
             await asyncio.to_thread(b.reconcile_wakes)
-            if b.store.policy.clock_trusted:cleanup.push_async_callback(stop_task,asyncio.create_task(sweep_forever(b)))
+            if b.store.policy.clock_trusted:
+                stopping=asyncio.Event();sweeper.append(asyncio.create_task(sweep_forever(b,stopping)))
+                cleanup.push_async_callback(stop_sweeping,sweeper[0],stopping)
             if enable_idle:b.dreamer.start()
             if hub:hub.start();cleanup.callback(hub.stop)
             yield
@@ -234,8 +272,12 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
         response.headers['Cache-Control']='no-store'
         response.headers['X-Content-Type-Options']='nosniff'
         response.headers['Referrer-Policy']='no-referrer'
+        # No response may be framed: a hostile page cannot overlay the inspector's approval controls (clickjacking).
+        response.headers['X-Frame-Options']='DENY'
+        csp=response.headers.get('Content-Security-Policy')
+        response.headers['Content-Security-Policy']=(csp+'; ' if csp else '')+"frame-ancestors 'none'"
         return response
-    app.add_middleware(Guard,credentials=[*keys,*skeys]) # added last = outermost
+    app.add_middleware(Guard,credentials=list(keys),sensor_credentials=list(skeys),sensor_paths={'/observations/sensor'}) # added last = outermost
     adapter_label=b.robot.state().get('adapter')
     @app.get('/health')
     def health():return {'ok':True,'robot':adapter_label,'mode':b.mode,'service':'cortex'}
@@ -249,13 +291,21 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
         return {'path':str(p),'sha256':hashlib.sha256(body.encode()).hexdigest(),'contract':body,'model_prompt_enabled':bool(b.qwen)}
     @app.post('/memory/sources')
     def teach(body:Source,principal=Depends(operator)):
+        if body.kind=='future':raise Denied('the "future" kind is reserved for commitments; schedule one with POST /prospective')
+        if body.supersedes:own_source(body.supersedes,principal)      # a revision retires the old source: its owner's act
         with b.activity.foreground():return b.store.teach(body.title,body.text,owner=principal,**body.model_dump(exclude={'title','text'}))
+    def own_source(sid,principal):
+        """A source is revoked, deleted or revised by its owner, or by an explicitly configured administrator; another
+        operator's source (a commitment included) is refused."""
+        if b.store.source_state(sid)['origin']!=principal and principal not in admins:raise Denied('the source belongs to another operator')
     @app.post('/memory/sources/{sid}/revoke')
     def revoke(sid:str,principal=Depends(operator)):
+        own_source(sid,principal)
         with b.activity.foreground():b.store.revoke_source(sid)
         return {'source_id':sid,'status':'revoked'}
     @app.delete('/memory/sources/{sid}')
     def delete(sid:str,principal=Depends(operator)):
+        own_source(sid,principal)
         with b.activity.foreground():b.store.revoke_source(sid,delete=True)
         return {'source_id':sid,'status':'deleted'}
     @app.post('/memory/rules/{aid}/resolve')
@@ -276,9 +326,9 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     @app.get('/memory/facts')
     def facts(principal=Depends(operator)):return b.store.rules()
     @app.get('/memory/derived')
-    def derived(principal=Depends(operator)):return b.store.derived()
+    def derived(principal=Depends(operator)):return [d for d in b.store.derived() if b.store.visible(d['refs'],principal)]
     @app.get('/evidence/{cid}')
-    def evidence(cid:str,principal=Depends(operator)):return b.store.evidence(cid)
+    def evidence(cid:str,principal=Depends(operator)):return b.store.evidence(cid,principal=principal)
     @app.post('/observations/operator')
     def observe(body:Observation,principal=Depends(operator)):
         if b.mode=='PHYSICAL':raise Denied('physical sensor observations must enter through the reviewed hardware integration, not a browser assertion')
@@ -286,15 +336,18 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     @app.post('/commands')
     def command(body:Command,principal=Depends(operator)):
         return present(b.command(body.text,principal=principal,idempotency_key=body.idempotency_key,cloud_allowed=body.cloud_allowed))
+    # Every planning request is foreground work for its whole length, as /commands is: idle dreaming yields to it.
     @app.post('/plan')
     def plan(body:PlanInput,principal=Depends(operator)):
-        return present(b.command(body.request,principal=principal))
+        with b.activity.foreground():return present(b.command(body.request,principal=principal))
     @app.post('/plan/rest')
     @app.post('/plan/goto')
     def goto(body:ZoneInput,principal=Depends(operator)):
-        return present(b.propose(Goal('goto',zone=body.zone),'Go to '+body.zone,principal=principal))
+        with b.activity.foreground():return present(b.propose(Goal('goto',zone=body.zone),'Go to '+body.zone,principal=principal))
     @app.post('/goals/propose')
     def goal(body:GoalInput,principal=Depends(operator)):
+        with b.activity.foreground():return propose_goal(body,principal)
+    def propose_goal(body:GoalInput,principal:str):
         selected=Goal.from_dict(body.goal)
         if safety_reason(body.request):raise Denied(safety_reason(body.request))
         try:parsed=parse_goal(body.request,b.store)
@@ -333,19 +386,28 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     @app.get('/capabilities')
     def capabilities(principal=Depends(operator)):
         return [{'name':name,'args':{k:t.__name__ for k,t in args.items()},'physical':name in PHYSICAL,'acceptance':b.mode} for name,args in CAPS.items()]
+    # A procedure built from another operator's commitment stays that operator's, as its derived memories do.
     @app.get('/skills')
-    def skills(principal=Depends(operator)):return b.skills.list()
+    def skills(principal=Depends(operator)):return [s for s in b.skills.list() if b.store.visible(s['definition'].get('refs',[]),principal)]
     @app.get('/skills/{sid}')
-    def get_skill(sid:str,principal=Depends(operator)):return b.skills.get(sid)
+    def get_skill(sid:str,principal=Depends(operator)):return seen_skill(sid,principal)
+    def seen_skill(sid,principal):
+        """A procedure this principal may see; one hidden from them (built on another's commitment or episode) is, for
+        reading, testing, approving and revoking alike, not there."""
+        s=b.skills.get(sid)
+        if not b.store.visible(s['definition'].get('refs',[]),principal):raise Missing('skill not found in the Cortex registry')
+        return s
     @app.post('/skills/{sid}/test')
     def test_skill(sid:str,principal=Depends(operator)):
+        seen_skill(sid,principal)
         with b.activity.foreground():return b.skills.test(sid)
     @app.post('/skills/{sid}/approve')
     def approve_skill(sid:str,body:Decision,principal=Depends(operator)):
+        seen_skill(sid,principal)
         return b.skills.approve(sid,body.digest,principal=principal)
     @app.post('/skills/{sid}/revoke')
     def revoke_skill(sid:str,principal=Depends(operator)):
-        b.skills.revoke(sid);return {'id':sid,'status':'REVOKED'}
+        seen_skill(sid,principal);b.skills.revoke(sid);return {'id':sid,'status':'REVOKED'}
     @app.get('/prospective')
     def tasks(principal=Depends(operator)):
         return b.store.rows('SELECT p.* FROM prospective_task p JOIN cx_commitment c ON c.id=p.id WHERE c.owner=? ORDER BY p.created_at',(principal,))
@@ -362,7 +424,10 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
         return [{**x,'proposal':present(x['proposal'])} if 'proposal' in x else x for x in b.trigger(body.trigger,event_id=body.event_id,principal=principal)]
     @app.get('/events')
     def events(limit:int=100,principal=Depends(operator)):
-        return b.store.rows('SELECT o.* FROM operation_event o LEFT JOIN cx_episode e ON e.id=o.episode_id WHERE e.owner=? OR o.episode_id IS NULL ORDER BY o.seq DESC LIMIT ?',(principal,max(1,min(limit,200))))
+        # Their operations' events and the system events they caused; of the rest, only an allowlisted public kind.
+        return b.store.rows('SELECT o.* FROM operation_event o LEFT JOIN cx_episode e ON e.id=o.episode_id LEFT JOIN cx_event_owner w ON w.seq=o.seq '
+                            f"WHERE e.owner=? OR w.owner=? OR (o.episode_id IS NULL AND w.owner IS NULL AND o.op IN ({','.join('?'*len(PUBLIC_EVENTS))})) "
+                            'ORDER BY o.seq DESC LIMIT ?',(principal,principal,*PUBLIC_EVENTS,max(1,min(limit,200))))
     @app.post('/dream/compile')
     def dream(principal=Depends(operator)):return b.dreamer.cycle(force=True)
     @app.get('/dream/status')
@@ -372,7 +437,7 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     def turn(body:Turn,principal=Depends(operator)):
         return b.intent.turn(body.state,disclosure_allowed=bool(body.cloud_allowed and b.store.policy.cloud_enabled))
     @app.get('/metrics')
-    def metrics(principal=Depends(operator)):return b.metrics()
+    def metrics(principal=Depends(operator)):return b.metrics(principal)
     @app.get('/camera/status')
     def camera_status(principal=Depends(operator)):return hub.metadata() if hub else {'available':False,'reason':'not configured'}
     @app.get('/frame.jpg')
@@ -391,8 +456,10 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
             try:
                 while not await req.is_disconnected():
                     f=await asyncio.to_thread(hub.latest,after=seq,wait_s=.5)
-                    if f and hub.receipt_age(f)<2:
-                        seq=f.seq
+                    if not f:continue
+                    # A stale frame is skipped but still passed: the next read waits for a newer one, never re-reads it at once.
+                    seq=f.seq
+                    if hub.receipt_age(f)<2:
                         yield b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '+str(len(f.jpeg)).encode()+b'\r\nX-Frame-Sequence: '+str(seq).encode()+b'\r\n\r\n'+f.jpeg+b'\r\n'
             finally:hub.unwatch()
         return StreamingResponse(frames(),media_type='multipart/x-mixed-replace; boundary=frame')

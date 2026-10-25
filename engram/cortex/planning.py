@@ -11,11 +11,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .store import Store
-from .types import Conflict, CortexError, Goal, Missing, Policy, canonical, digest, finite, normalize
+from .types import CONTROL_OPS, Conflict, CortexError, Denied, Goal, Missing, Policy, canonical, digest, finite, normalize
 
 NEGATED = re.compile(r"\b(do not|don't|dont|never|no need to|must not|mustn't|not now|stop moving|cancel|cancell?ed|never ?mind|scratch that|forget (?:it|that)|hold on|hold off|wait|undo|abort)\b", re.I)
 FUTURE = re.compile(r'\b(when|once|after|until|later|tomorrow|tonight|in\s+\d+\s+(?:seconds?|minutes?|hours?))\b', re.I)
 FORBIDDEN = re.compile(r'\b(delete|erase|wipe|dump|dispose|discard|throw|pour|hit|break|override|disable)\b', re.I)
+# The stop vocabulary of the brain (engram/engine.py) and the console parser, deliberately broad: any utterance that
+# contains one is a STOP ("don't stop the timer" too). A needless stop costs one clear_stop; a missed one can hurt someone.
+STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa|wait|pause|hold\s+on|hold\s+it|hang\s+on)\b", re.I)
 RECALL = re.compile(r'\b(what happened|where (?:is|was|are|were)|what did|what do you (?:know|remember)|what is pending|what have|why did|show (?:my|the) memor|recall)\b', re.I)
 
 # This is a subset of the team's verified adapter interface, not newly invented motor behavior.
@@ -28,11 +31,18 @@ CAPS = {
     'speak': {'text':str},
 }
 PHYSICAL = set(CAPS) - {'stop','observe','locate_tag','speak'}
-# The ONLY ops a plan for each goal kind may contain (the model's JSON schema uses the same table).
+# Ops that move the robot (and so whatever the claw holds).
+NAVIGATION = {'go_to_zone','drive_bounded','turn_bounded','approach_tag'}
+# Ops that act on whatever the claw holds.
+CLAW = {'gripper_open','gripper_close'}
+# Ops whose effect depends on what the claw holds: they carry it, need it empty, put it down or grip or release it.
+CLAW_BOUND = NAVIGATION | {'pick_tagged_object','place_at_zone'} | CLAW
+# The ONLY ops a plan for each goal kind may contain (the model's JSON schema uses the same table). A control op
+# (CONTROL_OPS) is none of them: a primitive goal naming one allows no step at all.
 GOAL_OPS = {'fetch':('observe','locate_tag','pick_tagged_object','place_at_zone'),'goto':('go_to_zone',),'inspect':('observe','locate_tag')}
 def goal_ops(goal: dict | Goal | None) -> tuple[str, ...]:
     g=goal.to_dict() if isinstance(goal,Goal) else goal or {}
-    return (g.get('primitive'),) if g.get('kind')=='primitive' and g.get('primitive') in CAPS else GOAL_OPS.get(g.get('kind'),())
+    return (g.get('primitive'),) if g.get('kind')=='primitive' and g.get('primitive') in set(CAPS)-CONTROL_OPS else GOAL_OPS.get(g.get('kind'),())
 
 # Grammar: refuse by default. Anything below means the utterance says more than "move X to Y".
 QUESTION = re.compile(r"\?\s*$|^\s*(?:should|shall|do|does|did|is|are|was|were|am|may|might|must|what|why|how|which|who|whose|whether|where|when|(?:can|could|would|will)\s+(?:i|we)\b)\b", re.I)
@@ -103,7 +113,7 @@ def parse_goal(request: str, store: Store) -> Goal:
     kinds=[k for k,v in VERBS.items() if re.search(r'\b(?:'+v+r')\b',low)]
     if len(kinds)>1 or sum(len(re.findall(r'\b(?:'+v+r')\b',low)) for v in VERBS.values())>1:
         raise Missing('more than one action in one request; give one instruction at a time')
-    ids=store.resolve_objects(request)
+    ids=store.resolve_targets(request)   # each target named unambiguously: an alias two objects share is refused
     zone=store.resolve_zone(request)
     extra=_uncovered(low,store)
     if kinds and extra: raise Missing('unrecognised words '+repr(' '.join(extra)[:80])+'; name only registered objects and one registered station')
@@ -120,6 +130,8 @@ def parse_goal(request: str, store: Store) -> Goal:
 def validate_step(step: Any, object_ids: set[str], zones: set[str]) -> None:
     if not isinstance(step,dict) or set(step)!={'op','args'} or step.get('op') not in CAPS:
         raise CortexError('step must contain an allowlisted op and args')
+    # Checked for every plan (composed, a stored procedure, a model's) and again at dispatch.
+    if step['op'] in CONTROL_OPS: raise Denied(f"{step['op']} is a control action, never a plan step: use the STOP control")
     op,args=step['op'],step['args']
     if not isinstance(args,dict) or set(args)!=set(CAPS[op]): raise CortexError('wrong primitive argument names')
     for key,want in CAPS[op].items():
@@ -156,7 +168,9 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
     objects=dict(fixture.get('objects',{})); seen=set(); holding=None; at=fixture.get('at_zone')
     original=dict(positions); open_=True; stopped=False
     goal_ids=set(goal.targets)
-    relevant=set(goal_ids)
+    # A claw primitive handles what the adapter reports in the claw: that object's rules count as its targets' do.
+    held=Compiler.held(goal,fixture)
+    relevant=set(goal_ids)|held
     for _ in range(policy.max_nodes):
         old=len(relevant)
         relevant.update(r['object'] for r in rules if r['subject'] in relevant)
@@ -182,6 +196,11 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
             op,a=step['op'],step['args']; res.steps_checked+=1
             if op not in allowed: raise Conflict(f'extra effect: {op} is not allowed for a {goal.kind} goal')
             if op in PHYSICAL and stopped: raise Conflict('motion after stop')
+            # The claw's initial content travels with every navigation and blocks every pickup: a reported load, or an
+            # unreported (unknown) content, fails closed. Opening the claw is checked below.
+            if loaded is not None and (op in NAVIGATION or op=='pick_tagged_object'):
+                raise Conflict(f'the claw already holds {loaded}; {op} would carry it or needs an empty claw' if fixture.get('holding_known') else
+                               f'the claw contents are unknown (not reported by the adapter); {op} needs a reported empty claw')
             if goal.kind=='primitive' and (op!=goal.primitive or a!=goal.args):
                 raise Conflict('primitive differs from the requested effect')
             if goal.kind=='goto' and a.get('zone')!=goal.zone: raise Conflict('navigation to a station other than the goal')
@@ -199,7 +218,6 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
                 if op=='approach_tag':
                     at=positions[oid]; continue
                 if holding: raise Conflict('already holding an object')
-                if fixture.get('holding_known') and fixture.get('holding') is not None: raise Conflict(f"the claw already holds {fixture['holding']}")
                 if not objects[oid].get('graspable',True): raise DeniedPlan('object not graspable')
                 for r in rules:
                     if r['subject']==oid and positions.get(r['object'])!=r['required_zone']:
@@ -219,7 +237,16 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
                     raise Conflict(f'the claw may be holding {loaded}; opening it would release that object without a placement check')
                 if holding: positions[holding]=at; holding=None
                 open_=True
-            elif op=='gripper_close': open_=False
+            elif op=='gripper_close':
+                # Closing grips whatever the claw holds: a reported object is handled (its constraints are the compiler's
+                # to check); unreported contents are unknown, never "empty".
+                if holding is None and not fixture.get('holding_known'):
+                    raise Conflict('the claw contents are unknown (not reported by the adapter); gripper_close needs a reported claw state')
+                # Gripping it is handling it: each of its prerequisites must be at its required station, as for a pickup.
+                for r in rules:
+                    if r['subject'] in held and positions.get(r['object'])!=r['required_zone']:
+                        raise Conflict('prerequisite object is not at its required station')
+                open_=False
         if holding: raise Conflict('task ends with unplaced object')
         if goal.kind=='fetch' and any(positions.get(oid)!=goal.zone for oid in goal.targets):
             raise Conflict('requested goal was not reached' if all(original.get(o) is not None for o in goal.targets) else
@@ -231,18 +258,23 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
         res.ok=True
     except CortexError as e:
         res.errors.append(str(e))
-    res.final_state={'positions':positions,'at_zone':at,'holding':holding,'gripper_open':open_,'stopped':stopped}
+    res.final_state={'positions':positions,'at_zone':at,'holding':holding if holding is not None else loaded,'gripper_open':open_,'stopped':stopped}
     return res
 
 
 class DeniedPlan(CortexError): pass
 
 
+class CompilerGap(Conflict):
+    """The compiler composed a plan for a supported goal that its own independent check rejects: a gap in the
+    compiler, not a refusal. Only this may go to the local model (whose plan passes the same refusals and checks)."""
+
+
 class Compiler:
     """Deterministic synthesis from a supported goal and CURRENT accepted rules."""
     def __init__(self, store: Store): self.store=store
 
-    def fixture(self, *, mode: str='SIMULATED') -> dict:
+    def fixture(self, *, mode: str='SIMULATED', symbolic: bool=False) -> dict:
         zones=sorted(self.store.zones())
         if not zones: raise Missing('no station registry')
         # Only a FRESH observation is a position. Anything else is unknown (None), never
@@ -251,20 +283,60 @@ class Compiler:
         objects={o['id']:{'tag':o['tag'],'graspable':o['graspable']} for o in objs}
         pos={o['id']:o['last_zone'] if o['fresh'] and o['last_zone'] else None for o in objs}
         # What the claw holds is the adapter's to report (Brain._fixture); the store alone never knows, so: unknown.
+        # A symbolic start state (practice, skill tests, a plan composed without a live world) declares an empty claw;
+        # live proposal and approval re-verify against the adapter's report.
         return {'mode':mode,'positions':pos,'objects':objects,'zones':zones,'at_zone':None,'unknown_positions':sorted(k for k,v in pos.items() if v is None),
-                'holding':None,'holding_known':False}
+                'holding':None,'holding_known':symbolic}
 
-    def compile(self, goal: Goal, fixture: dict | None=None) -> dict:
+    def compile(self, goal: Goal, fixture: dict | None=None, *, steps: list[dict] | None=None) -> dict:
+        """The plan for a supported goal: composed here or, given steps (the local model's), those, held to the same
+        refusals and the same independent check. A composed plan that check rejects is a CompilerGap."""
         goal=Goal.from_dict(goal.to_dict())
-        f=copy.deepcopy(fixture or self.fixture())
-        rules=self.store.related_rules(goal)
-        relevant=set(goal.targets)|{r['object'] for r in rules}
-        if self.store.unresolved_for(self.store.scope(goal,rules)):raise Missing('an applicable source has an unresolved conditional rule or safety statement; structured review required')
-        if self.store.prohibitions(relevant) and goal.kind=='fetch': raise DeniedPlan('current source prohibits moving an involved object')
-        if any(r['status']!='active' for r in rules): raise Conflict('conflicting applicable source rules need resolution')
-        positions=dict(f['positions']); steps=[]; ancestry=set()
+        f=copy.deepcopy(fixture or self.fixture(symbolic=True))   # no live world given: the symbolic start state
+        held=self.held(goal,f)                                     # a claw primitive handles what the claw holds
+        rules=self.store.related_rules(goal,held)
+        self.refuse(goal,f,rules)
         if not set(goal.targets)<=set(f['objects']): raise Missing('unregistered goal target')
         if goal.zone and goal.zone not in f['zones']: raise Missing('unregistered destination')
+        if goal.kind=='fetch' or held:
+            # Refuse a cyclic or too deep prerequisite graph of what it handles, even where the current fixture already
+            # satisfies a rule.
+            def visit(oid,path=()):
+                if oid in path: raise Conflict('cyclic prerequisite graph')
+                if len(path)>self.store.policy.max_depth: raise Conflict('dependency depth exceeded')
+                for r in rules:
+                    if r['subject']==oid: visit(r['object'],path+(oid,))
+            for oid in [*goal.targets,*sorted(held)]: visit(oid)
+        composed=steps is None
+        if composed: steps=self._compose(goal,f,rules)
+        v=verify(goal,steps,f,rules,self.store.policy)
+        if not v.ok: raise (CompilerGap if composed else Conflict)('; '.join(v.errors))
+        refs=sorted(set('source:'+r['source_id'] for r in rules)|set('rule:'+r['id'] for r in rules))
+        plan={'goal':goal.to_dict(),'steps':steps,'rules_used':[r['id'] for r in rules],
+              'evidence':sorted(set(r['chunk_id'] for r in rules)), 'refs':refs,
+              'basis':self.store.basis(goal,held),'policy_hash':self.store.policy.fingerprint(),
+              'verification':v.to_dict(),'origin':'composed_from_current_memory' if composed else 'proposed_and_verified'}
+        if held: plan['held']=sorted(held)      # what it grips: approval and dispatch hold the claw to exactly that
+        return plan
+
+    @staticmethod
+    def held(goal: Goal, f: dict) -> frozenset[str]:
+        """What a claw primitive handles: the object the adapter reports in the claw (closing grips it, opening releases it)."""
+        return frozenset({f['holding']}) if goal.kind=='primitive' and goal.primitive in CLAW and f.get('holding_known') and f.get('holding') else frozenset()
+
+    def refuse(self, goal: Goal, f: dict, rules: list[dict]) -> None:
+        """Raise the refusal current memory sets for this goal in this world: an unresolved statement or a prohibition on
+        what it involves or handles (a claw primitive handles the held object), or conflicting applicable rules. A control
+        action is no goal at all: it has its own path (Brain.stop)."""
+        if goal.kind=='primitive' and goal.primitive in CONTROL_OPS:
+            raise Denied(f'{goal.primitive} is a control action, not a goal: use the STOP control (POST /stop, or say "stop")')
+        held=self.held(goal,f); handles=goal.kind=='fetch' or bool(held)
+        if self.store.unresolved_for(self.store.scope(goal,rules)|held,handles=handles):raise Missing('an applicable source has an unresolved conditional rule or safety statement; structured review required')
+        if self.store.prohibitions(set(goal.targets)|{r['object'] for r in rules}|held) and handles: raise DeniedPlan('current source prohibits moving an involved object')
+        if any(r['status']!='active' for r in rules): raise Conflict('conflicting applicable source rules need resolution')
+
+    def _compose(self, goal: Goal, f: dict, rules: list[dict]) -> list[dict]:
+        positions=dict(f['positions']); steps=[]; ancestry=set()
 
         def place(oid,zone,depth=0):
             if depth>self.store.policy.max_depth: raise Conflict('dependency depth exceeded')
@@ -282,13 +354,6 @@ class Compiler:
             if len(steps)>self.store.policy.max_steps: raise Missing('task exceeds bounded primitive budget')
 
         if goal.kind=='fetch':
-            # Validate graph cycles even when the current fixture already satisfies a rule.
-            def visit(oid,path=()):
-                if oid in path: raise Conflict('cyclic prerequisite graph')
-                if len(path)>self.store.policy.max_depth: raise Conflict('dependency depth exceeded')
-                for r in rules:
-                    if r['subject']==oid: visit(r['object'],path+(oid,))
-            for oid in goal.targets: visit(oid)
             def needs(oid,acc):
                 for r in rules:
                     if r['subject']==oid and r['object'] not in acc: acc.add(r['object']); needs(r['object'],acc)
@@ -298,12 +363,4 @@ class Compiler:
         elif goal.kind=='goto': steps=[{'op':'go_to_zone','args':{'zone':goal.zone}}]
         elif goal.kind=='inspect': steps=[{'op':'locate_tag','args':{'object_id':oid}} for oid in goal.targets]
         elif goal.kind=='primitive': steps=[{'op':goal.primitive,'args':goal.args}]
-        if not steps: steps=[{'op':'observe','args':{}}]
-        v=verify(goal,steps,f,rules,self.store.policy)
-        if not v.ok: raise Conflict('; '.join(v.errors))
-        refs=sorted(set('source:'+r['source_id'] for r in rules)|set('rule:'+r['id'] for r in rules))
-        plan={'goal':goal.to_dict(),'steps':steps,'rules_used':[r['id'] for r in rules],
-              'evidence':sorted(set(r['chunk_id'] for r in rules)), 'refs':refs,
-              'basis':self.store.basis(goal),'policy_hash':self.store.policy.fingerprint(),
-              'verification':v.to_dict(),'origin':'composed_from_current_memory'}
-        return plan
+        return steps or [{'op':'observe','args':{}}]

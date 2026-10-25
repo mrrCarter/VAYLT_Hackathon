@@ -1,0 +1,187 @@
+"""Regression tests for luna's round-13 review of PR 7 (each fails with its fix reverted; controls/guards marked)."""
+import asyncio,json,threading,time
+import pytest
+from fastapi.testclient import TestClient
+from engram.cortex import api
+from engram.cortex.api import create_app
+from engram.cortex.runtime import Brain
+from engram.cortex.simulation import FakeRobot
+from engram.cortex.store import Store
+from engram.cortex.types import *
+from .test_fix_luna_r7 import TA,TB
+
+def approve(b,p,who='carther'): return b.approve(p['operation_id'],p['digest'],principal=who)
+def h(token): return {'Authorization':'Bearer '+token}
+LATCH="SELECT 1 FROM meta WHERE key='cortex_stop'"
+LAST_STOP="SELECT status,detail FROM operation_event WHERE op='stop' ORDER BY seq DESC LIMIT 1"
+
+
+# P1-1: on restart, an interrupted execution or a latched stop sends STOP to the adapter again, confirmed, and the latch
+# stays until an operator clears it: the latch blocks new approvals, the adapter's stop ends motion still under way.
+class Controller(FakeRobot):
+    """The adapter a restarted process gets: it counts the STOPs it receives."""
+    def __init__(self,arena): super().__init__(arena);self.stops=0
+    def stop(self): self.stops+=1;super().stop()
+
+def vault(tmp_path,arena,clock):
+    def open_brain(robot=None): s=Store(tmp_path/'v.db',clock=clock);s.register_arena(arena);return Brain(s,robot or Controller(arena))
+    return open_brain
+
+def test_a_restart_after_an_interrupted_execution_stops_the_adapter(tmp_path,arena,clock):
+    open_brain=vault(tmp_path,arena,clock);b=open_brain();p=b.command('Go to the shelf b',principal='carther')
+    with b.store.tx(): b.store.conn.execute("UPDATE episode SET outcome='running' WHERE id=?",(p['operation_id'],))   # died mid-step
+    b.close();robot=Controller(arena);b=open_brain(robot)
+    assert robot.stops==1 and robot.stopped                                                 # was: the adapter never told
+    assert b.store.one(LATCH) and b.operation(p['operation_id'])['status']=='unknown'
+    ev=b.store.one(LAST_STOP);assert ev['status']=='confirmed' and 'restart' in ev['detail'],ev
+    b.close()
+
+def test_a_restart_with_a_latched_stop_stops_the_adapter_again_until_it_is_cleared(tmp_path,arena,clock):
+    open_brain=vault(tmp_path,arena,clock);b=open_brain();b.stop();b.close()
+    robot=Controller(arena);b=open_brain(robot)
+    assert robot.stops==1 and robot.stopped and b.store.one(LATCH)                          # was: the new adapter not stopped
+    b.clear_stop(principal='carther');assert not b.store.one(LATCH) and not robot.stopped   # an explicit reset ends it
+    b.close()
+
+def test_control_a_clean_restart_sends_no_stop(tmp_path,arena,clock):
+    open_brain=vault(tmp_path,arena,clock);b=open_brain();b.close()
+    robot=Controller(arena);b=open_brain(robot);assert robot.stops==0 and not robot.stopped
+    b.close()
+
+class Unconfirmed(Controller):
+    def stop(self): self.stops+=1                                       # accepted, but the adapter does not report it
+    def state(self): return {**super().state(),'stopped':False}
+
+def test_guard_a_stop_the_adapter_accepts_but_does_not_report_is_recorded_unconfirmed(tmp_path,arena,clock):
+    open_brain=vault(tmp_path,arena,clock);b=open_brain();b.stop();b.close()
+    robot=Unconfirmed(arena);b=open_brain(robot)
+    assert robot.stops==1 and b.store.one(LATCH) and b.store.one(LAST_STOP)['status']=='requested'
+    b.close()
+
+class Unreachable(Controller):
+    def stop(self): self.stops+=1;raise ConnectionError('controller unreachable')
+
+def test_guard_a_stop_the_adapter_does_not_confirm_on_restart_keeps_the_latch(tmp_path,arena,clock):
+    open_brain=vault(tmp_path,arena,clock);b=open_brain();b.stop();b.close()
+    robot=Unreachable(arena);b=open_brain(robot)
+    assert robot.stops==1 and b.store.one(LATCH) and b._stopped.is_set()
+    assert b.store.one(LAST_STOP)['status']=='requested'                                    # recorded as unconfirmed
+    b.close()
+
+
+# P1-2 (class B): a procedure keeps the owner-scoped episodes it rests on. Alice's model plan was shown her private
+# episode and a shared SOP: Bob can never find or be offered the procedure, and purging her episode revokes it.
+from .test_fix_learn_verifier import GOOD_B,_model_brain
+SOP='Safety goggles must be at the ppe station before handling Sample B.'
+
+def test_a_procedure_resting_on_her_episode_and_a_shared_rule_stays_hers(arena,clock):
+    b,_=_model_brain(arena,clock,GOOD_B);s=b.store                                         # model first, auto-publish
+    s.teach('SOP',SOP,owner='alice')
+    routine=s.teach('Routine','Visiting the shelf is part of the round.',owner='alice',goal_definitions={'visit the shelf':{'kind':'goto','zone':'shelf_b'}})['source_id']
+    first=b.command('visit the shelf',principal='alice');b.reject(first['operation_id'],principal='alice')   # her own episode
+    p=b.command('Bring Sample B to the bench.',principal='alice')
+    assert p['source']=='model' and 'episode:'+first['operation_id'] in p['plan']['refs']   # it was in her prompt
+    goal=Goal('fetch',('sample_b',),'bench');skill=b.skills.find(goal,'alice')
+    assert skill and 'episode:'+first['operation_id'] in skill['definition']['refs']      # was: only the SOP's refs
+    assert b.skills.find(goal,'bob') is None                                               # was: Bob found and reused it
+    assert not s.bundle('Bring Sample B to the bench',goal,principal='bob')['applicable_skills']
+    s.revoke_source(routine,delete=True)                                                   # her episode is purged
+    assert b.skills.get(skill['id'])['status']=='REVOKED'                                  # was: still approved
+    b.close()
+
+def test_guard_a_requests_own_episode_is_never_among_its_related_episodes(store):
+    with store.tx():
+        for ep in ('ep_old','ep_now'):
+            store.conn.execute('INSERT INTO episode(id,goal,request,outcome,started_at) VALUES(?,?,?,?,?)',(ep,'{}','Bring Sample B to bench','rejected',1))
+            store.conn.execute('INSERT INTO cx_episode VALUES(?,?,?,?,?,?,?,?,?,?)',(ep,'SIMULATED','{}','','','{}',None,'',0,'op'))
+    related=store.bundle('Bring Sample B to bench',Goal('fetch',('sample_b',),'bench'),principal='op',episode='ep_now')['related_episodes']
+    assert [e['id'] for e in related]==['ep_old']
+
+
+# P2-3: shutdown is cooperative. It signals the timed-task sweeper and waits for a sweep in flight in its worker thread,
+# then closes the store; cancelling the await would leave that sweep running against a closed store.
+def owned_app(arena,clock,monkeypatch):
+    """An app that owns its brain (it closes it at shutdown), whose sweep blocks until released."""
+    s=Store(clock=clock,policy=Policy(clock_trusted=True));s.register_arena(arena);b=Brain(s,FakeRobot(arena))
+    entered,release,after=threading.Event(),threading.Event(),[]
+    def blocked():
+        entered.set();release.wait(5)
+        try:b.store.one('SELECT 1');after.append('open')
+        except Exception as e:after.append(type(e).__name__)
+        return []
+    b.sweep_due=blocked;monkeypatch.setattr(api,'_configured_brain',lambda:b)
+    client=TestClient(create_app(tokens={TA:'alice'},start_idle=False));client.__enter__();assert entered.wait(5)
+    return b,client,release,after
+
+def test_shutdown_waits_for_a_sweep_in_flight_before_closing_the_store(arena,clock,monkeypatch):
+    b,client,release,after=owned_app(arena,clock,monkeypatch)
+    closing=threading.Thread(target=client.__exit__,args=(None,None,None),daemon=True);closing.start()
+    time.sleep(.3);waited=closing.is_alive()
+    release.set();closing.join(10)
+    assert waited and after==['open'],(waited,after)                  # was: shut down at once; the sweep then hit a closed store
+    with pytest.raises(Exception):b.store.one('SELECT 1')            # closed once the sweep was done
+
+def test_guard_a_sweep_that_outlasts_the_shutdown_wait_leaves_the_store_open(arena,clock,monkeypatch):
+    monkeypatch.setattr(api,'SHUTDOWN_WAIT_S',.2,raising=False)
+    b,client,release,after=owned_app(arena,clock,monkeypatch)
+    threading.Timer(.6,release.set).start()                           # it ends after the shutdown gave up waiting for it
+    client.__exit__(None,None,None)
+    assert after==['open'] and b.store.one('SELECT 1')                # it ran on an open store, and the app left that open
+    b.close()
+
+
+# P2-4 (class B): an event with no operation is shown only through an explicit public allowlist (a STOP, a clock jump);
+# a system event an operator caused (clearing a stop, re-establishing the clock with a note) is that operator's alone.
+def test_a_system_event_an_operator_caused_is_theirs_and_only_public_kinds_are_shared(arena,clock):
+    s=Store(clock=clock,policy=Policy(clock_trusted=True));s.register_arena(arena);b=Brain(s,FakeRobot(arena))
+    with TestClient(create_app(b,tokens={TA:'alice',TB:'bob'},start_idle=False)) as c:
+        assert c.post('/stop',headers=h(TA)).status_code==200
+        assert c.post('/robot/clear_stop',headers=h(TA)).status_code==200
+        assert c.post('/clock/reestablish',json={'reason':'zqxnote the lab clock was set by hand'},headers=h(TA)).status_code==200
+        with s.tx(): s.conn.execute("INSERT INTO operation_event(operation_id,episode_id,op,args_json,status,detail,at) "
+                                    "VALUES('system:0',NULL,'clock_reestablished','{}','confirmed','zqxlegacy note',0)")   # an older version's row
+        seen=lambda token:[(e['op'],e['detail']) for e in c.get('/events',headers=h(token)).json()]
+        alice,bob=seen(TA),seen(TB)
+    assert ('stop','') in bob and ('stop','') in alice                                       # public: the STOP
+    assert not [e for e in bob if e[0] in ('clear_stop','clock_reestablished')],bob         # was: who cleared it, her clock note
+    assert ('clear_stop','alice') in alice and any('zqxnote' in d for _,d in alice)
+    assert not any('zqxlegacy' in d for _,d in alice+bob)                                    # unowned and not allowlisted: nobody's
+    b.close()
+
+
+# P3-5: the body guard gathers a body into one growing buffer, so a body in tiny chunks costs linear, not quadratic,
+# copying; and it never reads a body for a method that takes none (nor buffers one before any credential check).
+def asgi_scope(method,path,token=None):
+    headers=[(b'transfer-encoding',b'chunked')]+([(b'authorization',('Bearer '+token).encode())] if token else [])
+    return {'type':'http','asgi':{'version':'3.0'},'http_version':'1.1','method':method,'path':path,'raw_path':path.encode(),
+            'root_path':'','scheme':'http','query_string':b'','client':('127.0.0.1',1),'server':('127.0.0.1',80),'headers':headers}
+
+async def ok(scope,receive,send):
+    await send({'type':'http.response.start','status':200,'headers':[]});await send({'type':'http.response.body','body':b''})
+
+def test_a_body_in_one_byte_chunks_arrives_whole_at_linear_cost():
+    n,got=api.MAX_BODY,[]
+    async def echo(scope,receive,send): got.append(len((await receive())['body']));await ok(scope,receive,send)
+    guard=api.Guard(echo,credentials=[TA])
+    def best(target):                                                  # the best of three runs: machine noise only adds
+        times=[]
+        for _ in range(3):
+            left=[n]
+            async def receive():
+                left[0]-=1;return {'type':'http.request','body':b'x' if left[0]>=0 else b'','more_body':left[0]>=0}
+            async def send(m): pass
+            t=time.perf_counter();asyncio.run(target(receive,send));times.append(time.perf_counter()-t)
+        return min(times)
+    async def drain(receive,send):                                     # the cost of merely receiving those chunks
+        while (await receive())['more_body']: pass
+    async def guarded(receive,send): await guard(asgi_scope('POST','/memory/query',TA),receive,send)
+    received,cost=best(drain),best(guarded)
+    assert got==[n]*3 and cost<received*4,(received,cost)              # was: about 13 times, the body re-copied per byte
+
+def test_a_method_that_takes_no_body_never_has_one_read():
+    reads,sent=[],[]
+    async def receive(): reads.append(1);return {'type':'http.request','body':b'x'*1000,'more_body':True}   # an endless body
+    async def send(m): sent.append(m)
+    asyncio.run(api.Guard(ok,credentials=[TA])(asgi_scope('GET','/health'),receive,send))
+    # Round 14: a body on a method that takes none is refused, still unread (it was passed on unread in round 13).
+    assert not reads and sent[0]['status']==413                        # was: read and buffered, with no credential at all

@@ -7,19 +7,25 @@ from __future__ import annotations
 import collections
 import copy
 import json
+import math
 import threading
 import time
 from contextlib import contextmanager
 from typing import Callable
 
 from .models import IntentAdvisor, ModelUnavailable, QwenClient
-from .planning import Compiler, verify
+from .planning import PHYSICAL, Compiler, verify
 from .store import Store
 from .types import Conflict, CortexError, Denied, Goal, Missing, Stale, canonical, digest, text, uid
 
 
 class Skills:
     def __init__(self, store: Store): self.store=store
+
+    def digest(self, definition: dict) -> str:
+        """A procedure's identity: its definition, each episode it rests on standing for that episode's owner (Store.identity).
+        One operator's repeats are one procedure; another operator's is never the same one."""
+        return digest({**definition,'refs':self.store.identity(definition['refs'])}) if 'refs' in definition else digest(definition)
 
     def get(self, sid: str) -> dict:
         r=self.store.one('SELECT v.*,c.goal_key,c.basis_hash,c.policy_hash,c.validation_json,c.mode FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.id=?',(sid,))
@@ -38,8 +44,9 @@ class Skills:
         refs=plan.get('refs',[])
         if not refs or not self.store.refs_valid(refs): raise Missing('skill needs valid provenance')
         definition={k:plan[k] for k in ('goal','steps','rules_used','evidence','refs','basis','policy_hash')}
+        definition['refs']=self.identity_refs(goal,refs)
         definition['effect_contract']='Only the exact typed goal; physical execution always needs current approval.'
-        d=digest(definition)
+        d=self.digest(definition)
         with self.store.tx():
             old=self.store.one("SELECT id FROM skill_version WHERE digest=? AND status!='REVOKED'",(d,))
             if old: return self.get(old['id'])
@@ -53,9 +60,9 @@ class Skills:
     def test(self, sid: str, fixture: dict | None=None) -> dict:
         s=self.get(sid); d=s['definition']; g=Goal.from_dict(d['goal'])
         if s['status'] not in {'CANDIDATE','TESTED'}: raise Conflict('only a candidate/tested skill may be validated')
-        if digest(d)!=s['digest'] or not self.store.refs_valid(d['refs']): raise Stale('skill or its evidence changed')
+        if self.digest(d)!=s['digest'] or not self.store.refs_valid(d['refs']): raise Stale('skill or its evidence changed')
         compiler=Compiler(self.store)
-        f=copy.deepcopy(fixture or compiler.fixture())
+        f=copy.deepcopy(fixture or compiler.fixture(symbolic=True))
         # Validate on multiple controlled arrangements, not merely its authored example.
         variants=[f]
         zones=sorted(self.store.zones())
@@ -70,18 +77,30 @@ class Skills:
             for i,oid in enumerate(sorted(variant['objects'])):
                 ring=[zones[(i+shift+k)%len(zones)] for k in range(len(zones))]
                 variant['positions'][oid]=next((z for z in ring if z not in moves.get(oid,())),ring[0])
+            # The robot starts somewhere else too, away from the goal's station: a goto must actually travel. Each
+            # hypothetical arrangement starts with an empty claw (the skill's precondition; live use re-verifies).
+            variant.update(holding=None,holding_known=True)
+            variant['at_zone']=next((z for z in zones[shift:]+zones[:shift] if z!=g.zone),None)
             variants.append(variant)
         results=[]
         for v in variants:
-            results.append(verify(g,d['steps'],v,self.store.related_rules(g),self.store.policy,
-                                  expected_basis=d['basis'],actual_basis=self.store.basis(g)).to_dict())
+            results.append({**verify(g,d['steps'],v,self.store.related_rules(g),self.store.policy,
+                                     expected_basis=d['basis'],actual_basis=self.store.basis(g)).to_dict(),'start_zone':v.get('at_zone')})
+        # No effect step is no competence for a fetch or goto: such a procedure only "passes" where the goal already
+        # held (e.g. composed while the target sat at its destination), so it never becomes a skill.
+        if g.kind in {'fetch','goto'} and not any(st['op'] in PHYSICAL for st in d['steps']):
+            results.append({'ok':False,'errors':['no effect step: a no-op procedure passes only where the goal already holds'],'start_zone':None})
         passed=all(r['ok'] for r in results)
         record={'ok':passed,'mode':'SIMULATED','verifier':'symbolic-verifier-v1','cases':results,
                 'assumptions':'Registered primitives succeed in the symbolic environment; this is not physical competence evidence.',
                 'definition_digest':s['digest'],'basis':self.store.basis(g)}
         with self.store.tx():
+            # Recorded only on the procedure as it was validated: a revocation (or publication) meanwhile wins and is never
+            # undone here, so a revoked procedure cannot come back as TESTED and be approved.
+            if not self.store.conn.execute("UPDATE skill_version SET status=? WHERE id=? AND digest=? AND status IN ('CANDIDATE','TESTED')",
+                                           ('TESTED' if passed else 'CANDIDATE',sid,s['digest'])).rowcount:
+                raise Conflict('the skill changed while it was validated (revoked or published meanwhile)')
             self.store.conn.execute('UPDATE cx_skill SET validation_json=? WHERE id=?',(canonical(record),sid))
-            self.store.conn.execute('UPDATE skill_version SET status=? WHERE id=?',('TESTED' if passed else 'CANDIDATE',sid))
         return record
 
     def approve(self,sid: str, supplied_digest: str, *, principal: str, automatic: bool=False) -> dict:
@@ -92,7 +111,7 @@ class Skills:
             s=self.get(sid); d=s['definition']; g=Goal.from_dict(d['goal'])
             if s['status']!='TESTED' or not s['validation'] or not s['validation']['ok']:
                 raise Denied('independent verification must pass before publication')
-            if supplied_digest!=s['digest'] or digest(d)!=s['digest']: raise Conflict('skill digest changed')
+            if supplied_digest!=s['digest'] or self.digest(d)!=s['digest']: raise Conflict('skill digest changed')
             if self.store.basis(g)!=d['basis'] or d['policy_hash']!=self.store.policy.fingerprint() or not self.store.refs_valid(d['refs']):
                 raise Stale('skill dependencies changed')
             self.store.conn.execute("UPDATE skill_version SET status='APPROVED',approved_at=?,approved_by=? WHERE id=?",(self.store.clock(),principal,sid))
@@ -100,31 +119,63 @@ class Skills:
 
     def revoke(self,sid: str):
         self.get(sid)
-        with self.store.tx(): self.store.conn.execute("UPDATE skill_version SET status='REVOKED' WHERE id=?",(sid,))
+        # Never between a running step's final check and its dispatch (Store.authority_tx); the proposals built on it are
+        # withdrawn in the same transaction (Store.invalidate), as a revoked source's are.
+        with self.store.authority_tx():
+            self.store.conn.execute("UPDATE skill_version SET status='REVOKED' WHERE id=?",(sid,))
+            self.store.invalidate()
 
-    def provenance(self, goal: Goal, episode_id: str, extra_refs: list[str] | None=None) -> list[str]:
+    def identity_refs(self, goal: Goal, refs: list[str]) -> list[str]:
+        """The refs that identify a procedure: everything it rests on, which revocation, purging and privacy follow. A
+        derived memory (often this very system's last recipe) is replaced by what it cites, so revoking that still reaches
+        the procedure. Every episode stays: one an operator's plan rests on (a goal's anchor, a past request the model was
+        shown) keeps the procedure that operator's (Store.visible) and revokes it when purged. Nothing in the refs changes
+        with each request: the request's own episode is never among them (Store.bundle leaves it out)."""
+        core,todo,seen=set(),list(refs),set()
+        while todo:
+            r=todo.pop()
+            if r in seen or len(seen)>self.store.policy.max_nodes: continue
+            seen.add(r)
+            if r.startswith('derived:'):
+                row=self.store.one('SELECT refs_json FROM cx_derived WHERE id=?',(r[8:],))
+                todo+=json.loads(row['refs_json']) if row else [r]
+            else: core.add(r)
+        return sorted(core)
+
+    @staticmethod
+    def _anchor_key(goal: Goal, principal: str) -> str:
+        return 'cx_goal_anchor:'+principal+':'+goal.key()
+
+    def provenance(self, goal: Goal, episode_id: str, extra_refs: list[str] | None=None, *, principal: str) -> list[str]:
         """Refs a command adds to its plan. Commands are episodes, not sources, so a recipe or
         skill is keyed on goal + basis (rule/source refs), never on the request. A goal with no
-        rule or source cites the FIRST episode that asked for it, so repeats share one recipe."""
+        rule or source cites the FIRST episode its principal asked for it in, so that principal's
+        repeats share one recipe, and nobody's plan cites another operator's episode. There is
+        no anchor without a principal (none is shared under an empty one)."""
+        principal=text(principal,'principal',100)
         extra=list(extra_refs or [])
         if extra or self.store.related_rules(goal): return extra
-        key='cx_goal_anchor:'+goal.key()    # primary-key lookup, not a scan of past episodes
+        key=self._anchor_key(goal,principal)    # primary-key lookup, not a scan of past episodes
         with self.store.tx():
             self.store.conn.execute('INSERT OR IGNORE INTO meta VALUES(?,?)',(key,episode_id))
             return ['episode:'+self.store.one('SELECT value FROM meta WHERE key=?',(key,))['value']]
 
-    def find(self,goal: Goal) -> dict | None:
+    def find(self,goal: Goal,principal: str | None=None) -> dict | None:
+        """An approved, still valid procedure for this goal that this principal may see (Store.visible on its refs): one
+        built on another operator's commitment or episode is never selected for, or shown to, anyone else."""
         # Hot path: an indexed lookup by goal, each candidate validated below; no vault rescan.
         for r in self.store.rows("SELECT c.id FROM cx_skill c JOIN skill_version s ON s.id=c.id WHERE c.goal_key=? AND s.status='APPROVED' ORDER BY s.approved_at DESC",(goal.key(),)):
             s=self.get(r['id']); d=s['definition']
-            if (digest(d)==s['digest'] and d['basis']==self.store.basis(goal) and d['policy_hash']==self.store.policy.fingerprint()
-                    and s['validation'] and s['validation']['definition_digest']==s['digest'] and self.store.refs_valid(d['refs'])):
+            if (self.digest(d)==s['digest'] and d['basis']==self.store.basis(goal) and d['policy_hash']==self.store.policy.fingerprint()
+                    and s['validation'] and s['validation']['definition_digest']==s['digest'] and self.store.refs_valid(d['refs'])
+                    and self.store.visible(d['refs'],principal)):
                 return s
         return None
 
 
 class Activity:
-    """Process-local interactive activity; no inference is allowed to own the stop path."""
+    """Process-local interactive activity; no inference is allowed to own the stop path. Its lock is never taken while
+    the store's is held (foreground work begins before its transactions), so idle work may hold it over a commit."""
     def __init__(self, monotonic: Callable=time.monotonic):
         self.clock=monotonic; self.lock=threading.Lock(); self.busy=0; self.generation=0; self.last=self.clock()
 
@@ -141,11 +192,18 @@ class Activity:
     def snapshot(self):
         with self.lock: return self.busy,self.generation,self.clock()-self.last
 
+    @contextmanager
+    def quiet(self, generation: int):
+        """No foreground work begins while the block runs. Yields whether none began since `generation` (none busy, none
+        started): idle work that commits its result inside the block makes that check and that commit one step."""
+        with self.lock: yield self.busy==0 and self.generation==generation
+
 
 class Dreamer:
     LIVE_CAP=128                 # per-kind cap on LIVE rows (stale/deleted rows do not count)
     PRACTICE_WINDOW_S=86400.0    # practice cap is rolling: cases created in the last day
     BACKOFF_S=(30,60,120,300,600,1800,3600)
+    MODEL_ATTEMPTS=5             # failed model attempts on one input before it is explicitly abandoned
 
     def __init__(self, store: Store, skills: Skills, activity: Activity,
                  qwen: QwenClient | None=None, intent: IntentAdvisor | None=None, *,
@@ -156,7 +214,35 @@ class Dreamer:
         # Real model-call cap: at most N idle model calls per rolling window (default N =
         # policy.max_model_calls_per_dream), plus no repeat of an input already answered.
         self.model_window_s=model_window_s; self.model_calls_per_window=model_calls_per_window
-        self._model_calls=collections.deque(); self._model_answered=None; self.monotonic=time.monotonic
+
+    @property
+    def model_window_s(self) -> float: return self._model_window_s
+
+    @model_window_s.setter
+    def model_window_s(self, value):
+        # A zero or NaN window counts no past call at all, so a cap would never bind: only a positive finite one.
+        if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value<=0:
+            raise CortexError('the idle model-call window must be a positive, finite number of seconds')
+        self._model_window_s=float(value)
+
+    @property
+    def model_calls_per_window(self) -> int | None: return self._model_calls_per_window
+
+    @model_calls_per_window.setter
+    def model_calls_per_window(self, value):
+        if value is not None and (isinstance(value,bool) or not isinstance(value,int) or value<0):
+            raise CortexError('the idle model-call cap must be an integer of at least 0 (None: the policy cap)')
+        self._model_calls_per_window=value
+
+    def _model_state(self) -> dict:
+        """Vault-persisted model bookkeeping, so a restart neither resets the call cap nor forgets pending input:
+        call stamps (store clock) in the rolling window, the last input answered, and the input still pending."""
+        row=self.store.one("SELECT value FROM meta WHERE key='cx_dream_model'")
+        return json.loads(row['value']) if row else {'calls':[],'answered':None,'input':None,'attempts':0}
+
+    def _save_model_state(self, st: dict):
+        with self.store.tx():
+            self.store.conn.execute("INSERT INTO meta VALUES('cx_dream_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(canonical(st),))
 
     def start(self, interval_s: float=5):
         if self._thread and self._thread.is_alive(): return
@@ -179,11 +265,41 @@ class Dreamer:
         try: return self._cycle(force=force)
         finally: self._cycle_lock.release()
 
-    def _model_budget(self) -> bool:
-        cap=self.store.policy.max_model_calls_per_dream if self.model_calls_per_window is None else self.model_calls_per_window
-        now=self.monotonic()
-        while self._model_calls and now-self._model_calls[0]>=self.model_window_s: self._model_calls.popleft()
-        return cap>0 and len(self._model_calls)<cap
+    def _keep(self, q, asked: str, refs: list[str], made: list, errors: list, generation: int) -> bool:
+        """An idle answer is kept whole or not at all. Its hypotheses and the record that its input was answered commit in
+        one transaction inside Activity.quiet, so no foreground work can begin between its last check and its commit. If
+        some began since `generation`, nothing of it is kept and the input stays pending, to be asked again (False)."""
+        if self.store.in_tx(): raise RuntimeError('lock order: an idle answer is kept outside any transaction')
+        kept,rejected=[],[]
+        with self.activity.quiet(generation) as idle:
+            if not idle or self._stop.is_set(): return False
+            with self.store.tx():
+                for h in q.value.get('candidates',[])[:3]:
+                    if self._live_hypotheses()>=self.LIVE_CAP: break                # the cap holds for every accepted row
+                    try:                                                            # one bad candidate never sinks its siblings
+                        if not isinstance(h,dict) or set(h)!={'text','refs'} or not isinstance(h['refs'],list) or not all(isinstance(x,str) for x in h['refs']):
+                            raise Missing('malformed hypothesis candidate')
+                        if not h['refs'] or not set(h['refs'])<=set(refs): raise Missing('hypothesis must cite allowed refs')
+                        # It rests on everything its prompt showed, whatever it cites: it may quote a passage it does not
+                        # cite, so revocation and privacy follow every ref of that prompt, its citations kept as such.
+                        kept.append(self.store.derive('hypothesis',{'text':text(h['text'],'hypothesis',600),'cites':sorted(set(h['refs']))},
+                                                      sorted(set(refs)),origin='qwen_idle_hypothesis')['id'])
+                    except CortexError as e: rejected.append('hypothesis rejected: '+type(e).__name__)
+                st=self._model_state(); st.update(answered=asked,input=None,attempts=0); self._save_model_state(st)
+        made.extend(kept); errors.extend(rejected); return True
+
+    def _live_hypotheses(self) -> int:
+        return self.store.one("SELECT COUNT(*) n FROM cx_derived WHERE kind='hypothesis' AND status IN ('CANDIDATE','VERIFIED')")['n']
+
+    def _model_cap(self) -> int:
+        return self.store.policy.max_model_calls_per_dream if self.model_calls_per_window is None else self.model_calls_per_window
+
+    def _model_budget(self) -> float | None:
+        """None while an idle model call is allowed now; else when the oldest call in the rolling window leaves it."""
+        st=self._model_state(); now=self.store.clock()
+        calls=[t for t in st['calls'] if now-t<self.model_window_s]    # a stamp ahead of a stepped-back clock still counts
+        if calls!=st['calls']: st['calls']=calls; self._save_model_state(st)
+        return None if len(calls)<self._model_cap() else min(calls,default=now)+self.model_window_s
 
     def _backoff(self, failed: bool):
         with self.store.tx():
@@ -205,8 +321,10 @@ class Dreamer:
                           'commitments':self.store.rows('SELECT id,status FROM prospective_task ORDER BY created_at DESC LIMIT 16')})
         last=self.store.one("SELECT value FROM meta WHERE key='cx_dream_watermark'")
         backlog=self.store.one("SELECT 1 FROM episode e JOIN cx_episode c ON c.id=e.id WHERE e.outcome IN ('success','failed','unknown','aborted') AND NOT EXISTS (SELECT 1 FROM cx_consolidated k WHERE k.episode_id=e.id AND k.outcome=e.outcome) LIMIT 1")
-        if not force and not backlog and last and last['value']==watermark: return {'status':'no_new_evidence'}
-        started=time.monotonic(); run=uid('dream'); made=[]; practiced=[]; errors=[]; leftover=False
+        # Practice deferred by its rolling cap, or a model input deferred by the call budget, may resume now.
+        due=any(self.store.clock()>=float(w['value']) for w in self.store.rows("SELECT value FROM meta WHERE key IN ('cx_dream_practice_wait','cx_dream_model_wait')"))
+        if not force and not backlog and last and last['value']==watermark and not due: return {'status':'no_new_evidence'}
+        started=time.monotonic(); run=uid('dream'); made=[]; practiced=[]; errors=[]; leftover=False; model_pending=model_failed=False; practice_wait=model_wait=None
         with self.store.tx(): self.store.conn.execute('INSERT INTO cx_dream VALUES(?,?,?,?,?)',(run,self.store.clock(),None,'running','{}'))
         def interrupted():
             b,g,_=self.activity.snapshot()
@@ -240,7 +358,7 @@ class Dreamer:
                 if advice['status']=='ok' and (advice['scores']['conflict']>=0.8 or advice['scores']['practice']<0.2):
                     errors.append('Advisory practice veto; no permission or factual conclusion inferred.')
                     rules_now=[]
-            objects=self.store.objects(); zones=sorted(self.store.zones())
+            zones=sorted(self.store.zones())
             proposed=[]
             for r in rules_now:
                 if r['status']=='active' and zones:
@@ -257,8 +375,12 @@ class Dreamer:
                 if self.store.one('SELECT 1 FROM cx_practice WHERE id=?',(case_id,)): continue
                 # Unpractised goals left for a later cycle are a backlog: the watermark must not hide them.
                 if not still_idle() or len(practiced)>=self.store.policy.dream_batch: leftover=True; break
-                if self.store.one('SELECT COUNT(*) n FROM cx_practice WHERE created_at>?',(self.store.clock()-self.PRACTICE_WINDOW_S,))['n']>=self.LIVE_CAP: leftover=True; break
-                fixture=compiler.fixture()
+                window=self.store.clock()-self.PRACTICE_WINDOW_S
+                if self.store.one('SELECT COUNT(*) n FROM cx_practice WHERE created_at>?',(window,))['n']>=self.LIVE_CAP:
+                    # Goals are left but the rolling cap is full: wait, persisted, for its earliest case to leave the
+                    # window, instead of re-running (and logging) a cycle every tick until then.
+                    practice_wait=self.store.one('SELECT MIN(created_at) t FROM cx_practice WHERE created_at>?',(window,))['t']+self.PRACTICE_WINDOW_S; break
+                fixture=compiler.fixture(symbolic=True)
                 try:
                     plan=compiler.compile(goal,fixture); plan['refs']=sorted(set(plan['refs']+refs))
                     closure=self.store.related_rules(goal)
@@ -288,8 +410,13 @@ class Dreamer:
                         if test_result['ok'] and skill['status']!='APPROVED' and self.store.policy.auto_publish_verified and still_idle():
                             self.skills.approve(skill['id'],skill['digest'],principal='policy:'+self.store.policy.fingerprint(),automatic=True)
                 except CortexError as e: errors.append(type(e).__name__+': '+str(e))
-            # Local-model associations are hypotheses only, never automatically factual.
-            if self.qwen and still_idle() and self._model_budget():
+            # Local-model associations are hypotheses only, never automatically factual. The input is built and compared
+            # first: one already answered (or explicitly abandoned), or none worth asking, is no pending work and lets the
+            # watermark advance. A new input stays pending until the model answered it: past the time budget it keeps the
+            # watermark open; past the call budget it waits, persisted, until the oldest call leaves the window (idle ticks
+            # do not re-run the cycle meanwhile); a failed attempt keeps it open and backs off. A cap of zero never asks. An
+            # answer is kept whole, or (foreground work began) not at all and asked again: Dreamer._keep.
+            if self.qwen and self._model_cap()>0:
                 evidence=[]; refs=[]
                 for r in self.store.rules()[:4]:
                     if r['status']=='active':
@@ -299,35 +426,42 @@ class Dreamer:
                 # not limited to the presence of a robotics prerequisite rule.
                 declared=self.store.generic_facts()[:4]
                 for f in declared:refs+=['source:'+f['source_id']]
-                recent_sources=self.store.rows("SELECT c.id,c.source_id,c.text FROM source_chunk c JOIN cx_source s ON s.source_id=c.source_id JOIN source v ON v.id=c.source_id WHERE s.status='accepted' ORDER BY v.created_at DESC LIMIT 3")
+                recent_sources=self.store.rows("SELECT c.id,c.source_id,c.text FROM source_chunk c JOIN cx_source s ON s.source_id=c.source_id JOIN source v ON v.id=c.source_id WHERE s.status='accepted' AND v.kind!='future' ORDER BY v.created_at DESC LIMIT 3")
                 for c in recent_sources:refs+=['source:'+c['source_id']]
                 refs+=['episode:'+e['id'] for e in episodes[:2]]
-                live=self.store.one("SELECT COUNT(*) n FROM cx_derived WHERE kind='hypothesis' AND status IN ('CANDIDATE','VERIFIED')")['n']
+                live=self._live_hypotheses()
                 # The bundle is intentionally small; no whole-vault prompt.
-                bundle={'rules':evidence,'allowed_refs':sorted(set(refs)),'episodes':[{'id':e['id'],'outcome':e['outcome'],'mode':e['mode']} for e in episodes[:2]],'pending_commitments':self.store.rows("SELECT id,trigger,request,status FROM prospective_task WHERE status IN ('waiting','fired','unknown') LIMIT 3"),'approved_skills':self.store.rows("SELECT v.name,v.status FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.status='APPROVED' LIMIT 3"),'declared_knowledge':declared,'source_passages':recent_sources,'observations':[{'id':o['id'],'statement':o['statement'],'fresh':o['fresh']} for o in objects[:4]]}
+                # Only citable memory enters the prompt: every item carries a ref that is in allowed_refs. Observations,
+                # pending commitments and approved-skill rows have no resolvable ref, so a hypothesis could not cite them.
+                bundle={'rules':evidence,'allowed_refs':sorted(set(refs)),'episodes':[{'id':e['id'],'outcome':e['outcome'],'mode':e['mode']} for e in episodes[:2]],
+                        'declared_knowledge':declared,'source_passages':recent_sources}
                 asked=digest(bundle)
-                if refs and live<self.LIVE_CAP and asked!=self._model_answered:
-                    q=None; self._model_calls.append(self.monotonic())
-                    try: q=self.qwen.complete('dream',bundle)
+                if not (refs and live<self.LIVE_CAP and asked!=self._model_state()['answered']): pass     # nothing new to ask
+                elif not still_idle(): model_pending=True
+                elif (resume:=self._model_budget()) is not None: model_pending=True; model_wait=resume
+                else:
+                    st=self._model_state(); q=None; st['calls'].append(self.store.clock()); self._save_model_state(st)
+                    try: q=self.qwen.complete('dream',bundle)                           # yields to foreground work
                     except CortexError as e: errors.append(type(e).__name__)
-                    if q and not interrupted():
-                        self._model_answered=asked
-                        for h in q.value.get('candidates',[])[:3]:
-                            # One bad candidate never sinks its siblings or the cycle.
-                            try:
-                                if not isinstance(h,dict) or set(h)!={'text','refs'} or not isinstance(h['refs'],list) or not all(isinstance(x,str) for x in h['refs']):
-                                    raise Missing('malformed hypothesis candidate')
-                                if not h['refs'] or not set(h['refs'])<=set(refs): raise Missing('hypothesis must cite allowed refs')
-                                m=self.store.derive('hypothesis',{'text':text(h['text'],'hypothesis',600)},h['refs'],origin='qwen_idle_hypothesis')
-                                made.append(m['id'])
-                            except CortexError as e: errors.append('hypothesis rejected: '+type(e).__name__)
-            status='yielded' if interrupted() else 'complete'
+                    if q is None and interrupted(): model_pending=True                   # it yielded: not a failed attempt
+                    elif q is None:
+                        st=self._model_state(); n=st['attempts']+1 if st['input']==asked else 1
+                        if n>=self.MODEL_ATTEMPTS:
+                            st.update(answered=asked,input=None,attempts=0)    # explicitly abandoned, and recorded
+                            self.store.decision('dream_model','local',None,False,f'input abandoned after {n} failed model attempts')
+                        else: st.update(input=asked,attempts=n); model_pending=model_failed=True
+                        self._save_model_state(st)
+                    elif not self._keep(q,asked,refs,made,errors,generation): model_pending=True   # a late answer: asked again
+            status='yielded' if interrupted() else 'complete'; leftover=leftover or (model_pending and model_wait is None)
         except Exception as e:
             status='failed'; errors.append(type(e).__name__)
-        result={'id':run,'status':status,'derived_ids':list(dict.fromkeys(made)),'practice_ids':practiced,'errors':errors,
+        result={'id':run,'status':status,'derived_ids':list(dict.fromkeys(made)),'practice_ids':practiced,'errors':errors,'model_pending':model_pending,
                 'mode':'SIMULATED_PRACTICE','physical_actions':0,'weights_updated':False}
         with self.store.tx():
             if status=='complete' and not leftover: self.store.conn.execute("INSERT INTO meta VALUES('cx_dream_watermark',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(watermark,))
+            for key,wait in (('cx_dream_practice_wait',practice_wait),('cx_dream_model_wait',model_wait)):
+                if status=='complete' and wait: self.store.conn.execute("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,str(wait)))
+                elif status=='complete': self.store.conn.execute('DELETE FROM meta WHERE key=?',(key,))
             self.store.conn.execute('UPDATE cx_dream SET finished_at=?,status=?,summary_json=? WHERE id=?',(self.store.clock(),status,canonical(result),run))
-        if status!='yielded': self._backoff(status=='failed')
+        if status!='yielded': self._backoff(status=='failed' or model_failed)
         return result

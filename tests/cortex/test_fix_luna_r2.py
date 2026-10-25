@@ -2,7 +2,7 @@
 import pytest
 from engram.cortex.integration import GuardedUpstream
 from engram.cortex.learning import Skills
-from engram.cortex.planning import Compiler,parse_goal,verify
+from engram.cortex.planning import Compiler,DeniedPlan,parse_goal,verify
 from engram.cortex.runtime import Brain
 from engram.cortex.seeding import load_seed,synthetic_seed_present
 from engram.cortex.simulation import FakeRobot,Result
@@ -33,12 +33,12 @@ def test_safety_sentence_clears_only_for_what_the_reviewer_structured(store):
 # CORE P1: no physical handling without state progress.
 def test_redundant_handling_of_an_object_already_in_place_is_rejected(store):
     store.teach('Lab rule',RULE,owner='carther'); store.observe('goggles','ppe_station',origin='camera',mode='OPERATOR')
-    g=Goal('fetch',('sample_b',),'bench'); c=Compiler(store); f=c.fixture()
+    g=Goal('fetch',('sample_b',),'bench'); c=Compiler(store); f=c.fixture(symbolic=True)
     v=verify(g,move('goggles','ppe_station')+move('sample_b','bench'),f,store.related_rules(g),store.policy)
     assert not v.ok and 'no progress' in ' '.join(v.errors)
     assert [x['args']['object_id'] for x in c.compile(g,f)['steps'] if x['op']=='pick_tagged_object']==['sample_b']
     store.observe('sample_a','bench',origin='camera',mode='OPERATOR')            # a target already at its destination
-    assert not verify(Goal('fetch',('sample_a',),'bench'),move('sample_a','bench'),c.fixture(),[],store.policy).ok
+    assert not verify(Goal('fetch',('sample_a',),'bench'),move('sample_a','bench'),c.fixture(symbolic=True),[],store.policy).ok
 
 def test_stored_skill_that_would_re_handle_an_object_in_place_is_not_reused(arena,clock):
     s=Store(clock=clock,policy=Policy(auto_publish_verified=True));s.register_arena(arena);b=Brain(s,FakeRobot(arena))
@@ -62,12 +62,12 @@ def test_open_claw_is_refused_when_the_held_object_is_unknown(arena,clock):
 def test_open_claw_is_refused_when_loaded_even_after_proposal(brain):
     brain.store.teach('Restriction','Never move Sample B.',owner='carther')
     brain.robot.holding='sample_b'                                                 # the adapter reports Sample B in the claw
-    with pytest.raises(Conflict,match='holding sample_b'): brain.command('Open the claw',principal='carther')
+    with pytest.raises((Conflict,DeniedPlan)): brain.command('Open the claw',principal='carther')   # held, and prohibited (round 10)
     with pytest.raises(Conflict,match='already holds sample_b'): brain.command('Bring Sample A to the bench.',principal='carther')
     brain.robot.holding=None
     p=brain.command('Open the claw',principal='carther'); assert p['status']=='proposed'   # control: reported empty
     brain.robot.holding='sample_b'                                                 # loaded between proposal and approval
-    with pytest.raises(Denied): approve(brain,p)
+    with pytest.raises((Denied,Stale)): approve(brain,p)                           # round 12: not the claw it was proposed for
     assert ('gripper_open',{}) not in brain.robot.calls
 
 
@@ -111,8 +111,8 @@ def test_what_do_you_see_is_a_question_not_an_observe_proposal(brain):
 
 
 # LEARN P2: the vault's actual runtime decides; a store a PHYSICAL brain runs on is never seeded.
-def test_seed_is_refused_on_a_store_a_physical_brain_runs_on(arena,clock):
-    s=Store(policy=Policy(live_enabled=True),clock=clock);s.register_arena(arena);b=Brain(s,PhysicalLike(arena))
+def test_seed_is_refused_on_a_store_a_physical_brain_runs_on(tmp_path,arena,clock):
+    s=Store(tmp_path/'live.db',policy=Policy(live_enabled=True),clock=clock);s.register_arena(arena);b=Brain(s,PhysicalLike(arena))
     with pytest.raises(Denied,match='PHYSICAL runtime'): load_seed(s,SEED,principal='reviewer')
     assert not synthetic_seed_present(s)
     b.close()
@@ -121,11 +121,11 @@ def test_seed_is_refused_on_a_store_a_physical_brain_runs_on(arena,clock):
 # LEARN P2 as stated is not reproducible (an observe step is not allowed for a goto goal, whatever at_zone says);
 # the related guarantee kept here: skill-test variants always need the procedure, never pre-satisfy it.
 def test_goto_observe_only_plan_never_verifies_even_already_there(store):
-    f={**Compiler(store).fixture(),'at_zone':'bench'}
+    f={**Compiler(store).fixture(symbolic=True),'at_zone':'bench'}
     assert not verify(Goal('goto',zone='bench'),[{'op':'observe','args':{}}],f,[],store.policy).ok
 
 def test_skill_test_variants_start_handled_objects_away_from_their_destination(store):
-    g=Goal('fetch',('goggles',),'bench'); c=Compiler(store); f=c.fixture()      # goggles sort first: a plain shift puts them AT the bench
+    g=Goal('fetch',('goggles',),'bench'); c=Compiler(store); f=c.fixture(symbolic=True)      # goggles sort first: a plain shift puts them AT the bench
     plan=c.compile(g,f); plan['refs']=['episode:anchor']
     with store.tx(): store.conn.execute("INSERT INTO episode(id,goal,request,outcome,started_at) VALUES('anchor','{}','x','proposed',1)")
     k=Skills(store); sk=k.create(plan)
