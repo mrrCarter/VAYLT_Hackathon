@@ -4,6 +4,48 @@ A helper robot for a patient who cannot get up. The patient says a command (or i
 turns it into a short plan, a person approves that exact plan on the iPad (hold Approve), and only then
 does the robot move. "Stop" needs no approval: it stops the robot at once.
 
+Built on ENGRAM: the console's speech in and out (whisper and piper on the Pi), the brain's memory and
+safety rules ("Stop" always stops; "don't..." and "later..." never move anything; every move waits for a
+person), voice presets the intent model gets ready while the patient is still talking, hand signals read
+by the intent model, and the Cortex memory inspector.
+
+## Start here (step by step)
+
+**You need:** the robot with Brian's robot server running on the Pi (port 8200, with a non-default
+`ENGRAM_ROBOT_SECRET` in `~/engram_robot/robot.env`, see `docs/CDS_RUNBOOK.md` 9b), the iPad, a laptop on the
+same private hotspot, and the tags printed from `docs/tags-40mm.pdf` at **100% / actual size** (the black
+square must measure 40 mm). Tape **tag 5 on the pill bottle** and put **tag 15 at the patient's place** (on
+a box or post by the sofa, facing the room).
+
+1. **Put ENGRAM Assist on the Pi (once).** In an SSH window on the Pi, paste this as one line:
+
+   ```bash
+   cd ~/engram_hub && git fetch https://github.com/mrrCarter/VAYLT_Hackathon.git engram-assist && git show FETCH_HEAD:scripts/cds_update.sh > /tmp/cds_update.sh && bash /tmp/cds_update.sh engram-assist
+   ```
+
+   It saves anything changed on the Pi first (a backup branch, a patch, a copy of new files and the Python
+   packages) and its last line is the exact undo command: keep it. Brian's `~/engram_robot` is never touched.
+
+2. **Start on the pretend robot (nothing can move):** `bash ~/engram_hub/scripts/cds_up.sh --restart`.
+   On the iPad open `https://star-pi.local:8443` (first time: install the certificate, `docs/CDS_RUNBOOK.md`
+   section 7). Try the commands in the table below; approving is **press and hold**. Check:
+   "Where are my pills?" answers without a plan, and "Stop." stops.
+
+3. **Switch to the real robot:** wheels lifted for the first tries, one person's hand on the motor power.
+   `bash ~/engram_hub/scripts/cds_up.sh --real`. The status must say `plans + memory (real robot)`.
+   Say "Stop." first and check the robot reports stopped; clear it on the iPad. Then "Move forward",
+   "Turn left", "Pick it up", "Put it down", each approved by holding Approve.
+
+4. **Hand signals (laptop next to the robot):** see "Hand signals" below. It reads the robot's camera at
+   `http://star-pi.local:8200` and sends to the brain at `http://star-pi.local:8001`. The intent model needs
+   `TYPESAFE_API_KEY` (Carter gives it privately; never post it) and `TYPESAFE_INTENT_MODEL`.
+
+5. **Status any time:** `bash ~/engram_hub/scripts/cds_status.sh`. **Stop everything:**
+   `bash ~/engram_hub/scripts/cds_down.sh` (Brian's server keeps running).
+
+**Safety, always:** "Stop", the iPad's STOP button, an open palm to the camera, or the motor power switch.
+Nothing moves without an approval, but the robot cannot see behind or beside itself: keep the floor clear.
+
 ## Commands
 
 | Say | Plan the brain sends to Brian's robot server | What the robot does |
