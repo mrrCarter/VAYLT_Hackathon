@@ -107,11 +107,13 @@ def _default_transport(url: str, body: bytes, headers: dict[str, str], timeout_s
 
 def prepare_jpeg(data: bytes, max_side: int = DEFAULT_SIDE) -> bytes:
     """Any JPEG/PNG -> an RGB JPEG the API accepts: longest side at most max_side, except that a very narrow
-    image is enlarged until its short side reaches the API's 280 px minimum (never past its 1568 px limit)."""
+    image is enlarged until its short side reaches the API's 280 px minimum (never past its 1568 px limit).
+    Transparent pixels become white, as an image viewer shows them: dropping the alpha alone would reveal (and
+    send) whatever colour the hidden pixels hold."""
     if not MIN_SIDE <= max_side <= MAX_SIDE:
         raise ValueError(f"max_side must be in [{MIN_SIDE}, {MAX_SIDE}]")
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
     except ImportError:
         return _prepare_cv2(data, max_side)
     try:
@@ -119,6 +121,13 @@ def prepare_jpeg(data: bytes, max_side: int = DEFAULT_SIDE) -> bytes:
         img.load()
     except Exception as e:  # noqa: BLE001 - any decode failure is "not an image"
         raise VisionError(f"not a readable image: {type(e).__name__}") from None
+    try:  # a phone photo stores its rotation in EXIF and re-encoding drops it: apply it first (OpenCV's decode does)
+        img = ImageOps.exif_transpose(img)
+    except Exception:  # noqa: BLE001 - a malformed EXIF block is ignored; the pixels are still the photo
+        pass
+    if "transparency" in img.info or any(band in ("A", "a") for band in img.getbands()):
+        rgba = img.convert("RGBA")
+        img = Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba)
     img = img.convert("RGB")
     w, h = img.size
     scale = _scale(w, h, max_side)
@@ -136,7 +145,7 @@ def _prepare_cv2(data: bytes, max_side: int) -> bytes:
     except ImportError:
         raise VisionError("needs Pillow or OpenCV to read images: pip install pillow") from None
     try:
-        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        img = _decode_on_white(cv2, np, data)
     except Exception as e:  # noqa: BLE001 - OpenCV raises cv2.error on some inputs (e.g. an empty buffer)
         raise VisionError(f"not a readable image: {type(e).__name__}") from None
     if img is None:
@@ -152,6 +161,22 @@ def _prepare_cv2(data: bytes, max_side: int) -> bytes:
     if not ok:
         raise VisionError("could not encode the image")
     return jpg.tobytes()
+
+
+def _decode_on_white(cv2, np, data: bytes):
+    """BGR pixels, with any alpha composited onto white. A JPEG has no alpha and keeps the one fast decode (camera
+    frames); anything else is read once with its alpha, if it has one, and composited."""
+    buf = np.frombuffer(data, np.uint8)
+    if data[:2] != b"\xff\xd8":
+        raw = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+        if raw is not None and raw.ndim == 3 and raw.shape[2] in (2, 4):
+            full = float(np.iinfo(raw.dtype).max) if raw.dtype.kind == "u" else 1.0
+            alpha = raw[:, :, -1:].astype(np.float32) / full
+            color = raw[:, :, :-1].astype(np.float32) / full
+            if color.shape[2] == 1:  # grayscale + alpha: OpenCV 5 expands it to four channels, other builds may not
+                color = np.repeat(color, 3, axis=2)
+            return np.clip((color * alpha + (1.0 - alpha)) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
 
 
 def _scale(w: int, h: int, max_side: int) -> float:
@@ -188,8 +213,12 @@ class VisionClient:
         return cls(api_key=env.get("TYPESAFE_API_KEY", "").strip(),
                    model=env.get("TYPESAFE_INTENT_MODEL", "").strip(), **kw)
 
-    def ask(self, image: bytes, questions: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        """Ask questions about `frame` (the image). Returns {"answers", "model", "latency_ms"}."""
+    def _ask(self, image: bytes, questions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        """Ask questions about `frame` (the image). Returns {"answers", "model", "latency_ms"}.
+
+        Private: it checks the reply's shape, not the answers' VALUES. The public helpers below validate every value
+        (a probability outside [0, 1], NaN, an unknown label or a bad box is a VisionError), so no caller can act on
+        an unvalidated answer (luna round 11)."""
         jpeg = prepare_jpeg(image, self.max_side)
         ref = f"frame-{uuid.uuid4().hex}"
         body = json.dumps({
@@ -245,7 +274,7 @@ def _choice(answer: Any, options: Mapping[str, str]) -> tuple[str, float, dict[s
 def classify_hand_signal(image: bytes, client: VisionClient | None = None) -> dict[str, Any]:
     """Which hand signal is shown? -> {"signal", "probability", "confidence", "probs", "latency_ms", "model"}."""
     client = client or VisionClient.from_env()
-    out = client.ask(image, {
+    out = client._ask(image, {
         "signal": {"type": "choice",
                    "instructions": "Which hand signal is the person in `frame` making toward the camera?",
                    "criteria": HAND_SIGNALS},
@@ -258,7 +287,7 @@ def classify_hand_signal(image: bytes, client: VisionClient | None = None) -> di
 def scene_check(image: bytes, client: VisionClient | None = None) -> dict[str, Any]:
     """Care-room questions in one call: is someone there, on the floor, asking for help; their posture."""
     client = client or VisionClient.from_env()
-    out = client.ask(image, {
+    out = client._ask(image, {
         "person_present": {"type": "noul", "instructions": "Is at least one person visible in `frame`?"},
         "person_on_floor": {"type": "noul", "instructions":
                             "Is a person in `frame` lying or collapsed on the floor or the ground (not in a bed), "
@@ -289,7 +318,7 @@ def find_object(image: bytes, what: str, client: VisionClient | None = None,
     if not what or len(what) > 80:
         raise ValueError("describe the object in 1 to 80 characters")
     client = client or VisionClient.from_env()
-    out = client.ask(image, {
+    out = client._ask(image, {
         "present": {"type": "noul", "instructions": f"Is there a {what} visible in `frame`?"},
         "where": {"type": "box", "instructions": f"the {what} in `frame`"},
     })

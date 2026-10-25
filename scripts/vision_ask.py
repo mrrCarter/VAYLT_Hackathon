@@ -17,32 +17,113 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import math
 import sys
+import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from engram.vision.intent_vision import (VisionClient, VisionError, classify_hand_signal,  # noqa: E402
-                                         find_object, scene_check)
+from engram.vision.intent_vision import (MAX_TIMEOUT_S, VisionClient, VisionError,  # noqa: E402
+                                         classify_hand_signal, find_object, scene_check)
 
 
-def robot_frame(base: str) -> bytes:
+def _seconds(low: float, high: float, low_ok: bool):
+    """An argparse type for a finite number of seconds in range: `--every nan` would otherwise turn the live loop into
+    back-to-back calls to the paid API (nan <= 0 is false, and sleep(max(0.0, nan)) sleeps 0 s)."""
+    def parse(text: str) -> float:
+        v = float(text)
+        if not math.isfinite(v) or v > high or v < low or (v == low and not low_ok):
+            raise argparse.ArgumentTypeError(f"must be a number of seconds from {low:g} ({'inclusive' if low_ok else 'exclusive'}) to {high:g}")
+        return v
+    return parse
+
+
+def _robot_url(text: str) -> str:
+    """An argparse type: the robot server's http(s) URL. An empty --robot satisfied the required source group but read
+    as false below, so the CLI fell through to the webcam path with no camera (luna round 8)."""
+    u = urllib.parse.urlsplit(text)
+    if u.scheme not in ("http", "https") or not u.netloc:
+        raise argparse.ArgumentTypeError("must be the robot server's http:// or https:// URL")
+    return text
+
+
+MAX_FRAME_BYTES = 8 << 20  # a robot JPEG is a few hundred KB; anything this big is not a frame
+
+
+def robot_frame(base: str, deadline_s: float = 5.0, max_bytes: int = MAX_FRAME_BYTES) -> bytes:
+    """One frame from the robot server, within a wall-clock deadline and a size cap. urlopen's timeout bounds each
+    read, not the whole reply, so a server that stalls or drips bytes could hang the CLI (luna round 9). The fetch
+    runs on a daemon thread; the caller stops waiting at the deadline and the thread stops at its next read."""
+    url = base.rstrip("/") + "/robot/frame?annotate=false&quality=85"
+    result: dict = {}
+    finished, abandoned = threading.Event(), threading.Event()
+
+    def work() -> None:
+        try:
+            with urllib.request.urlopen(url, timeout=deadline_s) as r:
+                # read1 returns after ONE read of the socket, so an abandoned fetch sees the flag at the next bytes;
+                # read(n) would wait for all n bytes, and a server dripping a byte at a time could hold it for hours
+                read = getattr(r, "read1", r.read)
+                parts, size = [], 0
+                while not abandoned.is_set():
+                    chunk = read(64 << 10)
+                    if not chunk:
+                        result["frame"] = b"".join(parts)
+                        return
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise VisionError(f"robot frame: larger than {max_bytes} bytes")
+                    parts.append(chunk)
+        except http.client.HTTPException as e:  # e.g. IncompleteRead: a truncated reply is a failed frame, not a crash
+            result["error"] = VisionError(f"robot frame: {type(e).__name__}")
+        except BaseException as e:  # noqa: BLE001 - handed to the caller below
+            result["error"] = e
+        finally:
+            finished.set()
+
+    threading.Thread(target=work, name="robot-frame", daemon=True).start()
+    if not finished.wait(deadline_s):
+        abandoned.set()
+        raise VisionError("robot frame: deadline exceeded")
+    err = result.get("error")
+    if err is not None:  # OSError (a refused or timed-out connection) keeps its type: run() reports it as a failed frame
+        raise err if isinstance(err, (VisionError, OSError)) else VisionError(f"robot frame: {type(err).__name__}")
+    return result["frame"]
+
+
+def open_webcam(index: int):
+    """The opened camera. No OpenCV, or a camera that does not open, is a VisionError: a JSON line, not a traceback."""
     try:
-        with urllib.request.urlopen(base.rstrip("/") + "/robot/frame?annotate=false&quality=85", timeout=5) as r:
-            return r.read()
-    except http.client.HTTPException as e:  # e.g. IncompleteRead: a truncated reply is a failed frame, not a crash
-        raise VisionError(f"robot frame: {type(e).__name__}") from None
+        import cv2
+    except ImportError:
+        raise VisionError("--webcam needs OpenCV: pip install opencv-python") from None
+    try:
+        cap = cv2.VideoCapture(index)
+        opened = cap.isOpened()
+    except cv2.error as e:
+        raise VisionError(f"webcam {index}: {type(e).__name__}") from None
+    if not opened:
+        cap.release()
+        raise VisionError(f"webcam {index} did not open")
+    return cap
 
 
 def webcam_frame(cap) -> bytes:
     import cv2
 
-    ok, img = cap.read()
-    if not ok:
-        raise VisionError("webcam gave no frame")
-    ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    try:
+        ok, img = cap.read()
+        if not ok or img is None:
+            raise VisionError("webcam gave no frame")
+        ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    except cv2.error as e:  # OpenCV's own error is not an OSError: a bad frame is a failed frame, not a crash
+        raise VisionError(f"webcam frame: {type(e).__name__}") from None
+    if not ok or jpg is None or not len(jpg):
+        raise VisionError("webcam frame could not be encoded as JPEG")
     return jpg.tobytes()
 
 
@@ -51,13 +132,13 @@ def main() -> int:
     ap.add_argument("mode", choices=["hand", "scene", "find"])
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--image", nargs="+", help="image file(s)")
-    src.add_argument("--robot", help="robot server base URL, e.g. http://star-pi.local:8200")
+    src.add_argument("--robot", type=_robot_url, help="robot server base URL, e.g. http://star-pi.local:8200")
     src.add_argument("--webcam", type=int, help="local camera index")
     ap.add_argument("--what", help="object to find (find mode)")
-    ap.add_argument("--every", type=float, default=0.0,
+    ap.add_argument("--every", type=_seconds(0.0, 3600.0, low_ok=True), default=0.0,
                     help="start a live frame every N seconds, or as soon as the last answer is back if that is "
                          "slower (0 = one frame)")
-    ap.add_argument("--timeout", type=float, default=4.0)
+    ap.add_argument("--timeout", type=_seconds(0.0, MAX_TIMEOUT_S, low_ok=False), default=4.0)
     a = ap.parse_args()
     if a.mode == "find":
         a.what = " ".join((a.what or "").split())
@@ -92,12 +173,14 @@ def main() -> int:
         results = [run(p, lambda p=p: Path(p).read_bytes()) for p in a.image]
         return 0 if all(results) else 1
     cap = None
+    label = a.robot if a.robot is not None else f"webcam {a.webcam}"
     if a.webcam is not None:
-        import cv2
-
-        cap = cv2.VideoCapture(a.webcam)
-    label = a.robot or f"webcam {a.webcam}"
-    get = (lambda: robot_frame(a.robot)) if a.robot else (lambda: webcam_frame(cap))
+        try:
+            cap = open_webcam(a.webcam)
+        except VisionError as e:
+            print(json.dumps({"source": label, "error": str(e)}), flush=True)
+            return 1
+    get = (lambda: robot_frame(a.robot)) if a.robot is not None else (lambda: webcam_frame(cap))
     try:
         next_at = time.monotonic()
         while True:
