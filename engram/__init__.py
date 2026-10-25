@@ -9,6 +9,7 @@ The package is split so each teammate can work on one part:
 - executor.py    one step, observe, verify, journal (shared)
 - skills.py      experience compiler and approved skill reuse (Bharath)
 - prospective.py "when X happens, do Y" commitments (Bharath)
+- assist.py      ENGRAM Assist commands: move, turn, pick it up, put it down (docs/ASSIST.md)
 - robot/         robot adapters: fake for laptops, MasterPi for the real robot (Brian)
 - api.py         FastAPI server the iPad page talks to (Verna)
 """

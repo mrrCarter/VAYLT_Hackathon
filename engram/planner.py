@@ -16,10 +16,10 @@ import re
 import time
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 from .capabilities import describe_all
-from .memory import Memory, MemoryBundle
+from .memory import Memory, MemoryBundle, mentions
 
 REFUSE_WORDS = (
     "delete", "erase", "wipe", "forget everything", "disable stop", "turn off stop",
@@ -72,10 +72,17 @@ def refusal(request: str, future_ok: bool = False) -> str | None:
     return None
 
 
-def find_zone(request: str, zones: set[str]) -> str:
+def find_zone(request: str, zones: set[str], aliases: Mapping[str, str] | None = None) -> str:
+    """The zone a request names; else one an alias names ("me" -> the patient's place); else the default.
+
+    A named zone wins, so "Bring my pills to the bench" still goes to the bench.
+    """
     low = request.lower()
     for z in sorted(zones, key=len, reverse=True):
         if z.replace("_", " ").lower() in low:
+            return z
+    for alias, z in sorted((aliases or {}).items(), key=lambda kv: len(kv[0]), reverse=True):
+        if z in zones and mentions(low, alias):
             return z
     return DEFAULT_ZONE
 
@@ -99,7 +106,7 @@ class RulePlanner:
         if not targets:
             return PlanResult(None, refused="I don't know which object you mean. Can you name it?",
                               planner_calls=1, planning_ms=(time.perf_counter() - t0) * 1000)
-        zone = find_zone(request, self.zones)
+        zone = find_zone(request, self.zones, memory.zone_aliases)
         rules = [f for f in memory.current_facts() if f["predicate"] == "requires_before"]
 
         order: list[str] = []
@@ -204,4 +211,4 @@ class LlamaCppPlanner:
             res.note = f"{why}; reply starts: {text[:200]!r}" if text else why
             return res
         return PlanResult(plan, planner_calls=1, planning_ms=ms, source="model", note=f"reply starts: {text[:200]!r}",
-                          targets=targets_in(request, memory), zone=find_zone(request, self.zones))
+                          targets=targets_in(request, memory), zone=find_zone(request, self.zones, memory.zone_aliases))

@@ -224,7 +224,7 @@ def test_with_the_real_brain_a_thumbs_up_approves_and_runs_the_plan(tmp_path, en
     row = engine.conn.execute("SELECT approved_by, digest FROM approval WHERE target_id = ?",
                               (approve["operation_id"],)).fetchone()
     assert row["approved_by"] == WHO
-    assert engine.robot.state()["at_zone"] == "bench"   # the beaker run went to the bench
+    assert engine.robot.state()["at_zone"] == "patient"   # "me" is the patient's place
 
 
 def test_with_the_real_brain_a_thumbs_down_means_nothing_runs(tmp_path, engine, real_brain):
