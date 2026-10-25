@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field
 from .assist import register_assist
 from .capabilities import describe_all
 from .db import connect
-from .engine import Engine, EngineError
+from .engine import Engine, EngineError, OperationNotFound
 from .recall import Recall
 from .robot.mock import MockRobot
 from .skills import SkillError
@@ -91,6 +91,11 @@ class PlanIn(BaseModel):
 class ApproveIn(BaseModel):
     digest: str = Field(min_length=64, max_length=64)
     approved_by: str = Field(min_length=1, max_length=80)
+
+
+class RejectIn(BaseModel):
+    rejected_by: str = Field(min_length=1, max_length=80)
+    reason: str = Field(default="", max_length=200)
 
 
 class TagIn(BaseModel):
@@ -221,6 +226,19 @@ def create_app(engine: Engine | None = None) -> FastAPI:
     def approve(operation_id: str, body: ApproveIn) -> dict[str, Any]:
         try:
             return engine.approve_and_run(operation_id, body.digest, body.approved_by)
+        except EngineError as e:
+            raise fail(e)
+
+    @app.post("/operations/{operation_id}/reject")
+    def reject(operation_id: str, body: RejectIn) -> dict[str, Any]:
+        """A person declines a plan waiting for approval (a thumbs-down). It can never be approved afterwards.
+
+        Rejecting it again answers the same. 404: no such operation. 409: it is not waiting (running or done).
+        """
+        try:
+            return engine.reject(operation_id, body.rejected_by, body.reason)
+        except OperationNotFound as e:
+            raise HTTPException(status_code=404, detail=str(e)) from None
         except EngineError as e:
             raise fail(e)
 

@@ -13,6 +13,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 import pytest
@@ -192,6 +193,16 @@ def test_bring_me_my_pills_picks_tag_5_and_places_it_at_tag_15(rig):
     assert rig.journal() == [("pick_tagged", {"tag_id": 5}, "SUCCEEDED", "OK"),
                              ("place_at", {"zone_tag_id": 15}, "SUCCEEDED", "OK")]
     assert rig.sim.held is None and math.hypot(rig.sim.tags[5].x - 1.6, rig.sim.tags[5].y - 0.4) < 0.4
+
+
+def test_a_rejected_plan_never_reaches_the_robot(rig):
+    p = rig.command("Move forward")
+    out = call(f"{rig.brain}/operations/{p['operation_id']}/reject", {"rejected_by": "patient", "reason": "thumbs down"})
+    assert out["outcome"] == "cancelled"
+    with pytest.raises(urllib.error.HTTPError) as late:
+        rig.approve(p)
+    assert late.value.code == 409
+    assert rig.journal() == [] and rig.sim.odometry()[:2] == (0.0, 0.0)
 
 
 def test_without_a_recent_sighting_the_pill_fetch_stops_before_the_robot_moves(rig):

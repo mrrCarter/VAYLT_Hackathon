@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS episode (
     request TEXT NOT NULL,
     plan_json TEXT,
     evidence_json TEXT,
-    outcome TEXT NOT NULL DEFAULT 'proposed',  -- proposed | refused | rejected | running | success | failed | aborted
+    outcome TEXT NOT NULL DEFAULT 'proposed',  -- proposed | refused | rejected | running | success | failed | aborted | cancelled (a person rejected it)
     failure TEXT,
     planner_calls INTEGER NOT NULL DEFAULT 0,
     planning_ms REAL,

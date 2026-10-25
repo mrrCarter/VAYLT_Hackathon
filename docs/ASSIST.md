@@ -32,6 +32,12 @@ unit for a distance, nothing is planned and the brain says why, for example "I c
 refused or answered. "When the nurse leaves, move forward" is saved and proposed when it happens; it
 still needs approval.
 
+**Saying no to a plan** (a thumbs-down): `POST /operations/{operation_id}/reject` with
+`{"rejected_by": "patient", "reason": "thumbs down"}`. The plan ends `cancelled`, leaves
+`GET /operations/pending` and can never be approved; rejecting it again gives the same answer. An
+unknown id is 404, a plan that is no longer waiting is 409. Each pending plan has `created_at` (the
+brain's clock, ISO 8601 UTC) and `age_s`, so another machine can tell how old it is without its own clock.
+
 ## The pill bottle and the patient's place
 
 | | Tag (ArUco DICT_4X4_50) | Name in the brain | Other names it understands |
