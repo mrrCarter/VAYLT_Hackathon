@@ -49,17 +49,11 @@ brain's clock, ISO 8601 UTC) and `age_s`, so another machine can tell how old it
 goes to the bench. Print tags 5 and 15 with the others, at 40 mm like the rest: `python scripts/make_tags.py
 --mm 40`. Put tag 15 on a box or post next to the patient, facing where the robot will be after the pick.
 
-**Before "Bring me my pills" on the real robot:** its first step looks up a sighting of tag 5 from the
-last 10 minutes in the brain's memory (the overhead camera's job). With none, it stops at that step with
-"overhead camera has not seen pill_bottle recently" and the robot does not move. Without an overhead
-camera, post the sighting yourself just before:
-
-```bash
-curl -s -X POST http://star-pi.local:8001/observations/tag -H 'Content-Type: application/json' \
-  -d '{"tag_id": 5, "zone": "shelf_B"}'
-```
-
-The pick itself then needs the robot's camera to see tag 5.
+**How the robot finds them** (no overhead camera needed): the first step only looks, with the robot's
+own camera, and never moves. If tag 5 is not in view, the pick turns the robot in place, 30 degrees at a
+time and at most one full turn, until it sees the tag, then picks; the place does the same for tag 15.
+If it cannot find a tag after a full turn, that step fails ("not seen in 360 deg sweep") and nothing more
+happens. "Stop" while it turns stops it at once, and nothing is picked.
 
 ## Changing them
 

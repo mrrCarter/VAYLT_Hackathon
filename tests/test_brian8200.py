@@ -17,7 +17,8 @@ class FakeBrian:
 
     def __init__(self):
         self.calls, self.stops, self.beats = [], 0, 0
-        self.reply = {}  # op -> (status, code)
+        self.reply = {}  # op -> (status, code) or (status, code, data)
+        self.hooks = {}  # op -> called when that op arrives, before the reply (e.g. a stop pressed meanwhile)
 
     def verify(self, body):
         tok = body.get("authorization") or ""
@@ -50,8 +51,11 @@ class FakeBrian:
                     if body["op"] != "observe":
                         fake.verify(body)
                     fake.calls.append((body["op"], body["args"]))
-                    status, code = fake.reply.get(body["op"], ("SUCCEEDED", None))
-                    self._send(200 if status != "REJECTED" else 409, {"status": status, "code": code, "message": "m"})
+                    status, code, *data = fake.reply.get(body["op"], ("SUCCEEDED", None))
+                    if body["op"] in fake.hooks:
+                        fake.hooks[body["op"]]()
+                    self._send(200 if status != "REJECTED" else 409,
+                               {"status": status, "code": code, "message": "m", "data": data[0] if data else {}})
                 elif self.path == "/robot/stop":
                     fake.stops += 1
                     self._send(200, {"stopped": True})
@@ -86,8 +90,9 @@ def test_maps_and_signs_ops(brian):
     assert robot.execute("pick_tagged_object", {"object_id": "beaker"}).status == "done"
     assert robot.execute("place_at_zone", {"zone": "bench"}).status == "done"
     assert fake.calls == [("drive_bounded", {"distance_m": 0.2}), ("turn_bounded", {"angle_deg": 90.0}),
-                          ("arm_pose", {"pose": "reach"}), ("pick_tagged", {"tag_id": 4}),
-                          ("place_at", {"zone_tag_id": 14})]
+                          ("arm_pose", {"pose": "reach"}),
+                          ("detect_tag", {"tag_id": 4}), ("pick_tagged", {"tag_id": 4}),        # in view: no search
+                          ("detect_tag", {"tag_id": 14}), ("place_at", {"zone_tag_id": 14})]
 
 
 def test_unsensed_moves_count_but_unknown_pick_stops(brian):
@@ -107,6 +112,85 @@ def test_rejected_and_unmappable_fail_without_moving(brian):
     assert out.status == "failed" and "no action" in out.detail
     assert robot.execute("arm_pose", {"pose": "wave"}).status == "failed"
     assert [c[0] for c in fake.calls] == ["gripper_close"]
+
+
+def ops(fake):
+    return [op for op, _ in fake.calls]
+
+
+HIDDEN = {"detect_tag": ("FAILED", "E_TAG_NOT_FOUND")}          # the robot's camera does not see the tag now
+SEARCH_4 = ("search_tag", {"tag_id": 4, "max_turn_deg": 360.0})
+
+
+def test_locate_uses_a_fresh_sighting_then_the_robot_camera_and_never_moves(brian, engine):
+    robot, fake = brian
+    assert robot.execute("locate_tag", {"object_id": "beaker"}).status == "done" and fake.calls == []
+    engine.memory.freshness_s = 1e-9   # no fresh sighting any more: there is no overhead camera
+    fake.reply = {"detect_tag": ("SUCCEEDED", "OK", {"detection": {"distance_m": 0.62, "bearing_deg": -4.0}})}
+    seen = robot.execute("locate_tag", {"object_id": "beaker"})
+    assert seen.status == "done" and "sees tag 4 at 0.62 m, -4.0 deg" in seen.detail
+    fake.reply = HIDDEN
+    hidden = robot.execute("locate_tag", {"object_id": "beaker"})
+    assert hidden.status == "done" and "not in view now; the robot will turn to look for it" in hidden.detail
+    fake.reply = {"detect_tag": ("FAILED", "E_CAMERA")}
+    assert robot.execute("locate_tag", {"object_id": "beaker"}).status == "failed"   # cannot look is not "not there"
+    assert fake.calls == [("detect_tag", {"tag_id": 4})] * 3 and fake.stops == 0
+
+
+def test_a_pick_with_the_tag_in_view_does_not_search(brian):
+    robot, fake = brian
+    assert robot.execute("pick_tagged_object", {"object_id": "beaker"}).status == "done"
+    assert fake.calls == [("detect_tag", {"tag_id": 4}), ("pick_tagged", {"tag_id": 4})]
+
+
+def test_a_pick_with_the_tag_hidden_turns_to_find_it_then_picks(brian):
+    robot, fake = brian
+    fake.reply = HIDDEN
+    out = robot.execute("pick_tagged_object", {"object_id": "beaker"})
+    assert out.status == "done", out
+    assert fake.calls == [("detect_tag", {"tag_id": 4}), SEARCH_4, ("pick_tagged", {"tag_id": 4})]
+    assert fake.beats > 0 and fake.stops == 0                    # heartbeats ran through the step
+
+
+def test_a_search_that_finds_nothing_fails_the_step_and_never_picks(brian):
+    robot, fake = brian
+    fake.reply = {**HIDDEN, "search_tag": ("FAILED", "E_TAG_NOT_FOUND")}
+    out = robot.execute("pick_tagged_object", {"object_id": "beaker"})
+    assert out.status == "failed" and "looked for tag 4: FAILED E_TAG_NOT_FOUND" in out.detail
+    assert ops(fake) == ["detect_tag", "search_tag"] and fake.stops == 0
+
+
+def test_a_stop_latched_between_the_search_and_the_pick_means_no_pick(brian):
+    robot, fake = brian
+    fake.reply = HIDDEN
+    fake.hooks = {"search_tag": lambda: setattr(fake, "stops", fake.stops + 1)}   # Stop pressed while it turned
+    out = robot.execute("pick_tagged_object", {"object_id": "beaker"})
+    assert out.status == "failed" and "stop pressed after the robot found tag 4" in out.detail
+    assert ops(fake) == ["detect_tag", "search_tag"]
+
+
+def test_a_search_cut_short_is_unknown_stops_the_robot_and_is_never_retried(brian):
+    robot, fake = brian
+    fake.reply = {**HIDDEN, "search_tag": ("ABORTED", "E_ESTOP")}
+    out = robot.execute("pick_tagged_object", {"object_id": "beaker"})
+    assert out.status == "unknown" and ops(fake) == ["detect_tag", "search_tag"] and fake.stops == 1
+
+
+def test_nothing_is_sent_while_the_robot_is_stopped(brian):
+    robot, fake = brian
+    fake.stops = 1
+    for op, args in (("pick_tagged_object", {"object_id": "beaker"}), ("place_at_zone", {"zone": "bench"})):
+        out = robot.execute(op, args)
+        assert out.status == "failed" and "robot is stopped" in out.detail
+    assert fake.calls == []
+
+
+def test_a_place_turns_to_find_the_zone_marker_first(brian):
+    robot, fake = brian
+    fake.reply = HIDDEN
+    assert robot.execute("place_at_zone", {"zone": "bench"}).status == "done"
+    assert fake.calls == [("detect_tag", {"tag_id": 14}), ("search_tag", {"tag_id": 14, "max_turn_deg": 360.0}),
+                          ("place_at", {"zone_tag_id": 14})]
 
 
 def test_lost_robot_is_unknown(engine):
