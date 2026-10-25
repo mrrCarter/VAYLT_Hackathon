@@ -201,18 +201,18 @@ class Engine:
     def _command(self, text: str, who: str, bundle: MemoryBundle | None = None) -> dict[str, Any]:
         # A stop wins before anything else (it is still recorded as heard by command()).
         if STOP_WORDS.search(text):
-            return {"kind": "stopped", **self.stop(), "classification": "understood"}
+            return {"kind": "stopped", **self.stop(), **_classified("understood")}
         stripped = text.strip()
         if not stripped:  # nothing was heard: a misheard command, never a plan
             return self._refuse(stripped, "I didn't catch anything.", "misheard")
         body = rule_body(stripped)  # "Remember that ...", "Note that ...", "From now on, ..."
         if body is not None:
             return {"kind": "taught", **self.teach(f"Spoken note from {who}", body, kind="spoken", origin=who),
-                    "classification": "understood"}
+                    **_classified("understood")}
         if is_memory_question(stripped) or asks_question(stripped):
             # Answered from memory: never scheduled, never planned, nothing moves (practice check M2).
             # Any question counts, not only memory-shaped ones: a question is never a request to move.
-            return {"kind": "answer", **Recall(self.memory).recall(stripped), "classification": "understood"}
+            return {"kind": "answer", **Recall(self.memory).recall(stripped), **_classified("understood")}
         rule = deferred_rule(stripped)  # "When X, remember that ...": a rule cannot wait for an event
         if rule is not None:  # understood, and refused as said: a rule now, or a robot action to schedule
             reason = (f"I can only schedule a robot action, and not '{rule}': it is a rule. Say the rule now, or "
@@ -224,7 +224,7 @@ class Engine:
             src = self.memory.add_source(f"Future task from {who}", stripped, kind="spoken", origin=who)
             task_id, created = self.prospective.add(trigger, request, src)
             return {"kind": "scheduled", "task_id": task_id, "created": created, "trigger": trigger, "request": request,
-                    "classification": "understood"}
+                    **_classified("understood")}
         return {"kind": "proposal", **self.propose(stripped, bundle=bundle)}
 
     def propose(self, request: str, bundle: MemoryBundle | None = None) -> dict[str, Any]:
@@ -248,9 +248,9 @@ class Engine:
         if bundle is None or bundle.goal != request:
             bundle = self.memory.retrieve_memory_bundle(request, self.skills.approved_names())
         targets = targets_in(request, self.memory)
-        zone = find_zone(request, self.zones, self.memory.zone_aliases)
+        zone = find_zone(request, self.zones, self.memory.zone_aliases)  # None: a place that is not a zone, so no skill; the planner asks which
         fixed = self._fixed_steps(request)
-        skill = self.skills.find(targets, zone) if targets and fixed is None else None
+        skill = self.skills.find(targets, zone) if targets and zone and fixed is None else None
         if isinstance(fixed, str):   # a fixed request it recognized but will not plan, e.g. past a bound
             res = PlanResult(None, classification="understood", refused=fixed)   # understood, refused: stops nothing
         elif fixed is not None:

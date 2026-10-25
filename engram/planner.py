@@ -87,19 +87,28 @@ def refusal(request: str, future_ok: bool = False) -> str | None:
     return r[0] if r else None
 
 
-def find_zone(request: str, zones: set[str], aliases: Mapping[str, str] | None = None) -> str:
-    """The zone a request names; else one an alias names ("me" -> the patient's place); else the default.
+# A place a request names: a destination with an article or a possessive ("to the kitchen", "on my desk"), or
+# "here" / "there". With no zone named, "in a minute" reads as one too: unclear either way, and never planned now.
+PLACE = re.compile(r"\b(?:to|into|onto|on|at|in)\s+(?:the|my|your|our|his|her|their|a|an|this|that)\s+\w"
+                   r"|\b(?:here|there)\b")
 
-    A named zone wins, so "Bring my pills to the bench" still goes to the bench.
-    """
+
+def find_zone(request: str, zones: set[str], aliases: Mapping[str, str] | None = None) -> str | None:
+    """Where a request sends things: the zone it names ("from <zone>" is where they come from, not where they go);
+    else one an alias names ("me" -> the patient's place); DEFAULT_ZONE when it names no place at all; or None
+    when it names a place that is neither a zone nor an alias ("to the kitchen", "over here"). That request is
+    unclear: it is asked which place, and the bench is never guessed. A named zone wins, so "Bring my pills to
+    the bench" still goes to the bench."""
     low = request.lower()
+    for z in zones:
+        low = re.sub(rf"\bfrom\s+(?:the\s+)?{re.escape(z.replace('_', ' ').lower())}\b", " ", low)
     for z in sorted(zones, key=len, reverse=True):
         if z.replace("_", " ").lower() in low:
             return z
     for alias, z in sorted((aliases or {}).items(), key=lambda kv: len(kv[0]), reverse=True):
         if z in zones and mentions(low, alias):
             return z
-    return DEFAULT_ZONE
+    return None if PLACE.search(low) else DEFAULT_ZONE
 
 
 def targets_in(request: str, memory: Memory) -> list[str]:
@@ -122,6 +131,9 @@ class RulePlanner:
             return PlanResult(None, classification="unclear", refused="I don't know which object you mean.",
                               planner_calls=1, planning_ms=(time.perf_counter() - t0) * 1000)
         zone = find_zone(request, self.zones, memory.zone_aliases)
+        if zone is None:  # it names a place that is not a zone: unclear, never the bench by default
+            return PlanResult(None, classification="unclear", refused="Which place do you mean?",
+                              planner_calls=1, planning_ms=(time.perf_counter() - t0) * 1000)
         rules = [f for f in memory.current_facts() if f["predicate"] == "requires_before"]
 
         order: list[str] = []
@@ -175,11 +187,12 @@ def extract_json(text: str) -> dict | None:
     return json.loads(m.group(0)) if m else None
 
 
-def unresolved(plan: dict[str, Any], memory: Memory) -> str:
+def unresolved(plan: dict[str, Any], memory: Memory, zones: set[str]) -> str:
     """Why a model's plan does not resolve to what memory knows, or "": it has no steps, or it names an object that
-    memory does not have. The model did not work out what was meant, so the rule planner takes the request instead:
-    it plans it, or refuses it with its own classification ("I don't know which object you mean." is unclear).
-    Handed to the checker as it was, the plan would be turned down as understood, and a running plan would go on."""
+    memory does not have, or a place that is not a zone. The model did not work out what was meant, so the rule
+    planner takes the request instead: it plans it, or refuses it with its own classification ("I don't know which
+    object you mean." and "Which place do you mean?" are unclear). Handed to the checker as it was, the plan would
+    be turned down as understood, and a running plan would go on."""
     steps = plan.get("steps")
     if not isinstance(steps, list) or not steps:
         return "model plan has no steps"
@@ -189,6 +202,9 @@ def unresolved(plan: dict[str, Any], memory: Memory) -> str:
         obj = args.get("object_id") if isinstance(args, dict) else None
         if obj is not None and (not isinstance(obj, str) or obj not in known):
             return f"model plan names an object memory does not have: {obj!r}"
+        place = args.get("zone") if isinstance(args, dict) else None
+        if place is not None and (not isinstance(place, str) or place not in zones):
+            return f"model plan names a place that is not a zone: {place!r}"
     return ""
 
 
@@ -218,6 +234,8 @@ class LlamaCppPlanner:
         cls = classify_refusal(request)
         if cls:
             return PlanResult(None, classification=cls[1], refused=cls[0])
+        if find_zone(request, self.zones, memory.zone_aliases) is None:  # a place that is not a zone: the rules ask which one; the
+            return self.fallback.plan(request, bundle, memory)  # model is not asked to pick one for it
         t0 = time.perf_counter()
         # json_schema makes llama.cpp stop as soon as the plan object closes; without it the model
         # kept writing prose until n_predict (measured on the Pi 5: 512 tokens, 100 s wasted).
@@ -233,7 +251,7 @@ class LlamaCppPlanner:
             if not isinstance(plan, dict):
                 why = "model reply had no JSON plan"
             else:
-                why = unresolved(plan, memory)
+                why = unresolved(plan, memory, self.zones)
                 if why:  # the model did not work out what was meant: the rules take the request
                     plan = None
         except Exception as e:
