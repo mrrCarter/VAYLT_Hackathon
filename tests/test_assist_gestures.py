@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -64,39 +65,70 @@ def brain_date():
     return {"date": email.utils.formatdate(time.time(), usegmt=True)}   # what uvicorn sends
 
 
-def waiting_plan(op="ep_1", age=5.0):
-    return {"operation_id": op, "request": "Bring me my pills", "plan": {"goal": "Bring me my pills", "steps": []},
-            "digest": DIGEST, "source": "rules", "planner_note": "", "proposed_at": time.time() - age}
+def waiting_plan(op="ep_1", age=5.0, request="Bring me my pills", age_s=True):
+    """A plan as GET /operations/pending lists it. age_s=False: as from a brain that sends no age_s."""
+    proposed_at = time.time() - age
+    plan = {"operation_id": op, "request": request, "plan": {"goal": request, "steps": []}, "digest": DIGEST,
+            "source": "rules", "planner_note": "", "proposed_at": proposed_at}
+    if age_s:
+        plan["created_at"] = datetime.fromtimestamp(proposed_at, timezone.utc).isoformat(timespec="milliseconds")
+        plan["age_s"] = age
+    return plan
 
 
 class FakeBrain:
-    """Stands in for engram/api.py and records every call it gets."""
+    """Stands in for engram/api.py and records every call it gets. As in the real brain, a command
+    adds a waiting plan, and approving or rejecting one takes it off the waiting list."""
 
-    def __init__(self, pending=None, down=(), down_once=(), stop_reply=None):
+    def __init__(self, pending=None, down=(), down_once=(), stop_reply=None, reject_reply=None, date=True):
         self.calls = []
-        self.pending = pending if pending is not None else []
+        self.pending = list(pending or [])
+        self.rejected = set()
+        self.made = 0
         self.stop_reply = stop_reply or {"adapter": "mock", "stopped": True}
-        self.down = set(down)            # paths that fail as if the brain were unreachable
-        self.down_once = set(down_once)  # paths that fail the first time only
+        self.reject_reply = reject_reply  # (status, body) to answer every reject with, rejecting nothing
+        self.down = set(down)             # paths that fail as if the brain were unreachable
+        self.down_once = set(down_once)   # paths that fail the first time only
+        self.date = date                  # False: no Date header, as from a server that sends none
         self.client = httpx.Client(transport=httpx.MockTransport(self.handle), base_url="http://brain.test")
 
     def handle(self, request):
         body = json.loads(request.content) if request.content else None
         self.calls.append((request.method, request.url.path, body))
-        if request.url.path in self.down or request.url.path in self.down_once:
-            self.down_once.discard(request.url.path)
+        path = request.url.path
+        if path in self.down or path in self.down_once:
+            self.down_once.discard(path)
             raise httpx.ConnectError("no route to host", request=request)
-        route = (request.method, request.url.path)
+        route = (request.method, path)
         if route == ("GET", "/health"):
             return httpx.Response(200, json={"ok": True, "robot": "mock"})
         if route == ("POST", "/stop"):
             return httpx.Response(200, json=self.stop_reply)
         if route == ("GET", "/operations/pending"):
-            return httpx.Response(200, json=self.pending, headers=brain_date())
+            return httpx.Response(200, json=self.pending, headers=brain_date() if self.date else {})
         if route == ("POST", "/commands"):
-            return httpx.Response(200, json={"kind": "proposal", "status": "proposed", "operation_id": "ep_new"})
-        if request.method == "POST" and request.url.path.endswith("/approve"):
-            return httpx.Response(200, json={"operation_id": request.url.path.split("/")[2], "outcome": "success"})
+            self.made += 1
+            op = f"ep_new{self.made}"
+            self.pending.insert(0, waiting_plan(op, age=0.0, request=body["text"]))
+            return httpx.Response(200, json={"kind": "proposal", "status": "proposed", "operation_id": op})
+        _, kind, op, verb = (path.split("/") + ["", "", "", ""])[:4]
+        waiting = next((p for p in self.pending if p["operation_id"] == op), None)
+        if (request.method, kind, verb) == ("POST", "operations", "approve"):
+            if waiting is None:
+                return httpx.Response(409, json={"detail": "operation is not waiting for approval"})
+            self.pending.remove(waiting)
+            return httpx.Response(200, json={"operation_id": op, "outcome": "success"})
+        if (request.method, kind, verb) == ("POST", "operations", "reject"):
+            if self.reject_reply is not None:
+                return httpx.Response(self.reject_reply[0], json=self.reject_reply[1])
+            if waiting is None and op not in self.rejected:
+                return httpx.Response(404, json={"detail": f"no operation {op}"})
+            if waiting is not None:
+                self.pending.remove(waiting)
+            again = op in self.rejected
+            self.rejected.add(op)
+            return httpx.Response(200, json={"operation_id": op, "outcome": "cancelled", "already_rejected": again,
+                                             "failure": f"rejected by {body['rejected_by']}: {body['reason']}"})
         return httpx.Response(404, json={"detail": "Not Found"})
 
     def brain(self):
@@ -121,6 +153,9 @@ def action_line(lines, kind):
     return next(x for x in lines if x["event"] == "action" and x["action"] == kind)
 
 
+REJECT_BODY = {"rejected_by": "hand-signal", "reason": "patient signalled no"}
+
+
 # ---------------------------------------------------------------------------
 # What the brain receives
 # ---------------------------------------------------------------------------
@@ -137,57 +172,106 @@ def test_the_brain_gets_exactly_the_expected_calls(tmp_path):
         ("POST", "/operations/ep_1/approve", {"digest": DIGEST, "approved_by": WHO}),
         ("POST", "/commands", {"text": "Bring me my pills", "who": WHO}),
         ("POST", "/stop", None),
-        ("GET", "/operations/pending", None),          # the thumbs-down notes which plan it turned down
+        ("GET", "/operations/pending", None),
+        ("POST", "/operations/ep_new1/reject", REJECT_BODY),   # the pills plan, the one waiting by then
         ("POST", "/commands", {"text": "Pick it up", "who": WHO}),
     ]
     assert said == ["Okay, cancelled"]
-    assert actions(lines) == [("approve", "sent"), ("command", "sent"), ("stop", "sent"), ("cancel", "done"),
+    assert actions(lines) == [("approve", "sent"), ("command", "sent"), ("stop", "sent"), ("cancel", "sent"),
                               ("command", "sent")]
     approve = action_line(lines, "approve")
-    assert approve["operation_id"] == "ep_1" and approve["outcome"] == "success" and 4 < approve["plan_age_s"] < 10
+    assert approve["operation_id"] == "ep_1" and approve["outcome"] == "success"
+    assert approve["plan_age_s"] == 5.0                      # the brain's own age_s, not the Date header
     cancel = action_line(lines, "cancel")
-    assert cancel["cancelled"] == ["ep_1"] and "no reject endpoint" in cancel["note"]
+    assert (cancel["operation_id"], cancel["outcome"], cancel["already_rejected"]) == ("ep_new1", "cancelled", False)
     assert [x["signal"] for x in lines if x["event"] == "signal"] == ["thumbs_up", "peace", "open_palm",
                                                                       "thumbs_down", "fist"]
 
 
-@pytest.mark.parametrize("pending, why", [
-    ([], "no plan is waiting"),
-    ([waiting_plan("ep_1"), waiting_plan("ep_2", age=1.0)], "2 plans"),
-    ([waiting_plan("ep_1", age=75.0)], "old"),
+@pytest.mark.parametrize("case, why", [
+    ("none waiting", "no plan is waiting"),
+    ("two waiting", "2 plans"),
+    ("stale by age_s", "75 s old"),
+    ("age_s stale, proposed_at fresh", "75 s old"),   # the brain's age_s decides, not the Date header
+    ("no age_s, stale by the Date header", "old"),
+    ("no age_s and no Date header", "no Date header"),
 ])
-def test_a_thumbs_up_approves_nothing_unless_exactly_one_recent_plan_waits(tmp_path, pending, why):
-    fb = FakeBrain(pending=pending)
-    code, lines = run_main(["--images", str(frames(tmp_path, ["thumbs_up"] * 4))], brain=fb.brain())
+def test_hand_signals_act_only_on_exactly_one_recent_plan(tmp_path, case, why):
+    pending = {   # built here, not at import, so the Date-header ages are what they say
+        "none waiting": lambda: [],
+        "two waiting": lambda: [waiting_plan("ep_1"), waiting_plan("ep_2", age=1.0)],
+        "stale by age_s": lambda: [waiting_plan("ep_1", age=75.0)],
+        "age_s stale, proposed_at fresh": lambda: [{**waiting_plan("ep_1", age=5.0), "age_s": 75.0}],
+        "no age_s, stale by the Date header": lambda: [waiting_plan("ep_1", age=75.0, age_s=False)],
+        "no age_s and no Date header": lambda: [waiting_plan("ep_1", age=5.0, age_s=False)],
+    }[case]()
+    fb, said = FakeBrain(pending=pending, date=case != "no age_s and no Date header"), []
+    folder = frames(tmp_path, ["thumbs_up"] * 4 + PAUSE + ["thumbs_down"] * 4)
+    code, lines = run_main(["--images", str(folder), "--rate", "4"], brain=fb.brain(), said=said)
     assert code == 0
-    assert [c[:2] for c in fb.calls] == [("GET", "/health"), ("GET", "/operations/pending")]   # no approve
-    (refused,) = [x for x in lines if x["event"] == "action"]
-    assert refused["status"] == "refused" and why in refused["reason"]
+    assert [c[:2] for c in fb.calls] == [("GET", "/health"), ("GET", "/operations/pending"),
+                                         ("GET", "/operations/pending")]   # no approve, no reject
+    assert actions(lines) == [("approve", "refused"), ("cancel", "refused")]
+    assert all(why in x["reason"] for x in lines if x["event"] == "action")
+    assert said == []
 
 
-def test_a_thumbs_down_keeps_that_plan_from_being_approved(tmp_path):
+def test_without_age_s_the_date_header_ages_the_plan(tmp_path):
+    fb = FakeBrain(pending=[waiting_plan("ep_1", age=5.0, age_s=False)])
+    code, lines = run_main(["--images", str(frames(tmp_path, ["thumbs_up"] * 4))], brain=fb.brain())
+    approve = action_line(lines, "approve")
+    assert approve["status"] == "sent" and 5.0 <= approve["plan_age_s"] < 10.0   # rounded up by the slack
+
+
+def test_a_thumbs_down_rejects_the_waiting_plan_and_only_then_says_so(tmp_path):
     fb = FakeBrain(pending=[waiting_plan("ep_1")])
     folder = frames(tmp_path, ["thumbs_down"] * 4 + PAUSE + ["thumbs_up"] * 4)
-    code, lines = run_main(["--images", str(folder), "--rate", "4"], brain=fb.brain())
+    code, lines = run_main(["--images", str(folder), "--rate", "4"], brain=fb.brain(), said=fb.calls)
+    assert fb.calls[:5] == [("GET", "/health", None), ("GET", "/operations/pending", None),
+                            ("POST", "/operations/ep_1/reject", REJECT_BODY),
+                            "Okay, cancelled",                      # said after the brain confirmed the reject
+                            ("GET", "/operations/pending", None)]
+    assert actions(lines) == [("cancel", "sent"), ("approve", "refused")]
+    assert "no plan is waiting" in action_line(lines, "approve")["reason"]   # the plan left the waiting list
+
+
+@pytest.mark.parametrize("failure", ["unreachable", "409", "answer is not cancelled"])
+def test_a_failed_reject_says_nothing_and_no_thumbs_up_approves_that_plan(tmp_path, failure):
+    how = {"unreachable": {"down": {"/operations/ep_1/reject"}},
+           "409": {"reject_reply": (409, {"detail": "operation is running, not waiting for approval"})},
+           "answer is not cancelled": {"reject_reply": (200, {"operation_id": "ep_1", "outcome": "proposed"})}}
+    fb, said = FakeBrain(pending=[waiting_plan("ep_1")], **how[failure]), []
+    folder = frames(tmp_path, ["thumbs_down"] * 4 + PAUSE + ["thumbs_up"] * 4)
+    code, lines = run_main(["--images", str(folder), "--rate", "4"], brain=fb.brain(), said=said)
+    assert said == []
+    assert actions(lines) == [("cancel", "error"), ("approve", "refused")]
+    assert action_line(lines, "cancel")["remembered"] == ["ep_1"]
+    assert "cancelled with a thumbs-down" in action_line(lines, "approve")["reason"]   # the backstop
     assert not [c for c in fb.calls if c[1].endswith("/approve")]
-    assert actions(lines) == [("cancel", "done"), ("approve", "refused")]
-    assert "cancelled with a thumbs-down" in lines[-2]["reason"]
+
+
+def test_another_thumbs_down_tries_a_failed_reject_again(tmp_path):
+    fb, said = FakeBrain(pending=[waiting_plan("ep_1")], down_once={"/operations/ep_1/reject"}), []
+    folder = frames(tmp_path, ["thumbs_down"] * 4 + PAUSE + ["thumbs_down"] * 4)
+    code, lines = run_main(["--images", str(folder), "--rate", "4"], brain=fb.brain(), said=said)
+    assert actions(lines) == [("cancel", "error"), ("cancel", "sent")]
+    assert [c[:2] for c in fb.calls].count(("POST", "/operations/ep_1/reject")) == 2
+    assert said == ["Okay, cancelled"]
 
 
 def test_a_thumbs_down_that_cannot_read_the_plans_turns_thumbs_up_approvals_off(tmp_path):
-    fb = FakeBrain(pending=[waiting_plan("ep_1")], down_once={"/operations/pending"})
+    fb, said = FakeBrain(pending=[waiting_plan("ep_1")], down_once={"/operations/pending"}), []
     folder = frames(tmp_path, ["thumbs_down"] * 4 + PAUSE + ["thumbs_up"] * 4)
-    code, lines = run_main(["--images", str(folder), "--rate", "4"], brain=fb.brain())
-    assert actions(lines) == [("cancel", "done"), ("approve", "refused")]
-    cancel = action_line(lines, "cancel")
-    assert cancel["cancelled"] == [] and "approvals are off" in cancel["warning"]
-    assert "off for" in lines[-2]["reason"]                       # the plan list was readable by then
+    code, lines = run_main(["--images", str(folder), "--rate", "4"], brain=fb.brain(), said=said)
+    assert actions(lines) == [("cancel", "error"), ("approve", "refused")]
+    assert "approvals are off" in action_line(lines, "cancel")["warning"] and said == []
+    assert "off for" in action_line(lines, "approve")["reason"]   # the plan list was readable by then
     assert [c[:2] for c in fb.calls].count(("GET", "/operations/pending")) == 2
-    assert not [c for c in fb.calls if c[1].endswith("/approve")]
+    assert not [c for c in fb.calls if c[1].endswith(("/approve", "/reject"))]
 
 
 # ---------------------------------------------------------------------------
-# Against the real brain API (engram/api.py) on the mock robot
+# Against the real brain API (engram/api.py) on the mock robot, with the default map
 # ---------------------------------------------------------------------------
 @pytest.fixture
 def real_brain(engine):
@@ -206,20 +290,13 @@ def real_brain(engine):
     return ag.Brain("http://testserver", client=TestClient(app))
 
 
-def beaker_map(tmp_path):
-    data = json.loads((ROOT / "engram/vision/assist_signals.default.json").read_text())
-    data["signals"]["peace"]["text"] = "Bring me the beaker"   # the demo arena has no pills yet
-    path = tmp_path / "beaker.json"
-    path.write_text(json.dumps(data))
-    return str(path)
-
-
 def test_with_the_real_brain_a_thumbs_up_approves_and_runs_the_plan(tmp_path, engine, real_brain):
     folder = frames(tmp_path, ["peace"] * 4 + PAUSE + ["thumbs_up"] * 4)
-    code, lines = run_main(["--images", str(folder), "--rate", "4", "--map", beaker_map(tmp_path)], brain=real_brain)
+    code, lines = run_main(["--images", str(folder), "--rate", "4"], brain=real_brain)
     assert actions(lines) == [("command", "sent"), ("approve", "sent")]
     command, approve = [x for x in lines if x["event"] == "action"]
-    assert command["result"] == "proposed" and approve["operation_id"] == command["operation_id"]
+    assert command["text"] == "Bring me my pills" and command["result"] == "proposed"
+    assert approve["operation_id"] == command["operation_id"]
     assert approve["outcome"] == "success"
     row = engine.conn.execute("SELECT approved_by, digest FROM approval WHERE target_id = ?",
                               (approve["operation_id"],)).fetchone()
@@ -227,13 +304,18 @@ def test_with_the_real_brain_a_thumbs_up_approves_and_runs_the_plan(tmp_path, en
     assert engine.robot.state()["at_zone"] == "patient"   # "me" is the patient's place
 
 
-def test_with_the_real_brain_a_thumbs_down_means_nothing_runs(tmp_path, engine, real_brain):
+def test_with_the_real_brain_a_thumbs_down_rejects_the_plan(tmp_path, engine, real_brain):
+    said = []
     folder = frames(tmp_path, ["peace"] * 4 + PAUSE + ["thumbs_down"] * 4 + PAUSE + ["thumbs_up"] * 4)
-    code, lines = run_main(["--images", str(folder), "--rate", "4", "--map", beaker_map(tmp_path)], brain=real_brain)
-    assert actions(lines) == [("command", "sent"), ("cancel", "done"), ("approve", "refused")]
-    op = lines[[x["event"] for x in lines].index("action")]["operation_id"]
-    assert engine.conn.execute("SELECT outcome FROM episode WHERE id = ?", (op,)).fetchone()["outcome"] == "proposed"
+    code, lines = run_main(["--images", str(folder), "--rate", "4"], brain=real_brain, said=said)
+    assert actions(lines) == [("command", "sent"), ("cancel", "sent"), ("approve", "refused")]
+    command, cancel, approve = [x for x in lines if x["event"] == "action"]
+    assert cancel["operation_id"] == command["operation_id"] and cancel["outcome"] == "cancelled"
+    assert "no plan is waiting" in approve["reason"]                   # the rejected plan left the waiting list
+    ep = engine.conn.execute("SELECT outcome, failure FROM episode WHERE id = ?", (command["operation_id"],)).fetchone()
+    assert (ep["outcome"], ep["failure"]) == ("cancelled", "rejected by hand-signal: patient signalled no")
     assert engine.conn.execute("SELECT COUNT(*) FROM approval").fetchone()[0] == 0
+    assert said == ["Okay, cancelled"]
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +332,8 @@ def test_an_images_dry_run_logs_the_actions_and_never_calls_the_brain(tmp_path):
     assert actions(lines) == [("approve", "dry_run"), ("cancel", "dry_run"), ("command", "dry_run"),
                               ("stop", "dry_run")]   # the stop came 0.25 s after the command: no pause for STOP
     assert [x["file"] for x in lines if x["event"] == "signal"] == ["004.jpg", "021.jpg", "038.jpg", "039.jpg"]
-    assert said == ["Okay, cancelled"]
+    assert said == []                                   # "Okay, cancelled" only after a real reject
+    assert action_line(lines, "cancel")["would_say"] == "Okay, cancelled"
     assert lines[-1] == {**lines[-1], "event": "exit", "reason": "no more images", "frames": len(signals)}
 
 
@@ -428,8 +511,6 @@ def test_stop_goes_through_while_an_approve_is_still_running():
 # Pieces
 # ---------------------------------------------------------------------------
 def test_the_brains_clock_comes_from_its_date_header():
-    from datetime import datetime, timezone
-
     r = httpx.Response(200, headers={"date": "Sun, 25 Oct 2026 12:00:00 GMT"})
     noon = datetime(2026, 10, 25, 12, tzinfo=timezone.utc).timestamp()
     assert ag.brain_clock(r) == noon + 2.0                          # rounded up by the header's slack

@@ -93,16 +93,14 @@ signal it sees, and tells the brain what to do. The rules live in
 |---|---|
 | Open palm (flat hand, fingers up, palm to the camera) | **STOP, at once.** One frame is enough, and STOP is sent again on every frame while the palm stays up. Afterwards a person re-arms the robot: on the iPad, or `curl -s -X POST http://star-pi.local:8001/robot/clear_stop`. Re-arming is never a hand signal. |
 | Thumbs up | Approves the plan that is waiting, but only under the approval rules below. |
-| Thumbs down | Says "Okay, cancelled" out loud and approves nothing. The brain has no way to reject a plan yet, so the plan is still waiting in the brain (and on the iPad, where a person can still approve it); but no thumbs-up will ever approve it. |
-| Peace (V sign) | Sends "Bring me my pills" to the brain, as if the patient had said it. When the brain can plan it, the plan shows up on the iPad and waits for approval. |
-| Fist | Sends "Pick it up" to the brain, the same way. |
+| Thumbs down | Rejects the plan that is waiting, under the same rule as a thumbs-up (exactly one waiting, proposed less than 60 seconds ago), and then says "Okay, cancelled" out loud. The plan ends cancelled in the brain and can never be approved, on the iPad either. If the reject fails, nothing is said and the line says why; the loop still never approves that plan by hand signal, and another thumbs-down tries again. |
+| Peace (V sign) | Sends "Bring me my pills" to the brain, as if the patient had said it. The plan shows up on the iPad and waits for approval (a thumbs-up, or Approve on the iPad). |
+| Fist | Sends "Pick it up" to the brain, the same way (lower the arm, close the claw, lift). |
 | Pointing, waving | Nothing (for now). |
 
-The brain only plans for objects it knows (`fixtures/lab/arena.json`: Sample A, Sample B, Safety
-goggles, Beaker), and "Pick it up" names no object at all. Until the brain handles them, it answers
-both default commands with "I don't know which object you mean", the loop prints that answer, and
-nothing moves. To rehearse before then, change the command text in the map, for example to
-"Bring me the beaker".
+What the brain does with these two commands is in Commands and The pill bottle above. In
+particular, "Bring me my pills" needs a recent sighting of the pill bottle (tag 5) before the
+robot can move.
 
 ### The safety rules, in plain words
 
@@ -119,11 +117,14 @@ nothing moves. To rehearse before then, change the command text in the map, for 
    show it again afterwards. The open palm works during the pause.
 4. **A thumbs-up approves only when all of these are true**: exactly one plan is waiting (zero or
    two or more: nothing happens; use the iPad); it was proposed less than 60 seconds ago, by the
-   brain's own clock; nobody cancelled it with a thumbs-down. It approves that plan's exact
-   digest, so nothing else can be run by mistake.
-5. **A thumbs-down remembers** the plans waiting at that moment, and no later thumbs-up approves
-   them. If the loop cannot read the waiting plans just then, thumbs-up approval is switched off
-   for about a minute, until anything that was waiting is too old to approve anyway.
+   brain's own clock (the brain says how old each waiting plan is; if it ever does not, its HTTP
+   Date header stands in; with neither, nothing is approved); no thumbs-down turned it down. It
+   approves that plan's exact digest, so nothing else can be run by mistake.
+5. **A thumbs-down rejects the plan in the brain** under the same rule (exactly one waiting, less
+   than 60 seconds old), and says "Okay, cancelled" only once the brain confirms it. It also
+   remembers every plan waiting at that moment, so no later thumbs-up approves them even if the
+   reject failed. If the loop cannot read the waiting plans just then, thumbs-up approval is
+   switched off for about a minute, until anything that was waiting is too old to approve anyway.
 6. **When in doubt, nothing happens.** A failed check, a broken camera frame or a brain that does
    not answer counts as "no signal". The loop prints the problem and carries on; it never stops
    because of a bad frame or the network.
@@ -131,7 +132,8 @@ nothing moves. To rehearse before then, change the command text in the map, for 
    power, as in `docs/CDS_RUNBOOK.md` section 1. The open palm stops the robot only as fast as the
    classifier answers: run with `--verbose` and look at `latency_ms`.
 
-Every approval the loop makes is recorded in the brain as approved by "patient (hand signal)".
+The brain records every approval the loop makes as approved by "patient (hand signal)", and every
+reject as rejected by "hand-signal" with the reason "patient signalled no".
 
 ### Run it on the laptop, against the robot's camera
 
@@ -194,9 +196,10 @@ One line per event, each a JSON object with an `event` field:
 - `start`: the settings and the map in use; `brain`: whether the brain answered at start-up.
 - `signal`: a signal was recognised (held long enough, or an open palm), and which action it maps to.
 - `action`: what was done about it. `status` is `sent` (the brain answered; see `result`,
-  `outcome`, `reason`), `done`, `dry_run`, `skipped` (pause or busy; `reason` says which),
-  `refused` (an approval rule said no; `reason` says which), or `error` (the brain did not answer,
-  or answered with an error).
+  `outcome`, `reason`), `dry_run`, `skipped` (pause or busy; `reason` says which), `refused` (a
+  rule said no, for example two plans waiting; `reason` says which), or `error` (the brain did not
+  answer, or answered with an error). A thumbs-down's line also lists, as `remembered`, the plans
+  no thumbs-up will approve.
 - `say`: a sentence said out loud (`spoken: false` when the laptop has no voice).
 - `error`: a bad frame or a failed check (counted as no signal), or the brain unreachable.
 - `exit`: the loop ended (Ctrl+C, or the last image played).
@@ -217,7 +220,8 @@ signal gets an action:
 - Actions: `stop`, `approve`, `cancel` (the thumbs-down behaviour), `command` (needs `text`: the words
   sent to the brain, at most 500 characters), `none`.
 - `say` (optional, on any action but `none`): a short sentence said on the laptop when the action
-  happens. On a stop it is said once per palm, not on every frame.
+  happens. On a stop it is said once per palm, not on every frame; on a cancel, only after the
+  brain confirms the reject.
 - At least one signal must stop the robot. Any signal mapped to `stop` stops on a single frame.
 - Tuning: `hold_frames` (2 to 30), `hold_seconds` (0 to 10), `min_probability` (0.5 to 1),
   `cooldown_s` (0 to 60).
@@ -232,13 +236,12 @@ The map chooses which signal does what. It cannot change the safety rules above.
 
 ### Known gaps in the brain (for the brain team)
 
-- There is no endpoint to reject or cancel a waiting plan. A thumbs-down can only skip it here.
-  The plan stays waiting (a person can still approve it on the iPad) and stays on the brain's
-  waiting list for 5 minutes; meanwhile a thumbs-up for a newer plan sees two plans and does
-  nothing. A `POST /operations/{id}/reject` would let a thumbs-down remove it.
-- The waiting list does not say what time the brain thinks it is, so the loop reads the brain's
-  clock from the HTTP `Date` header, which is only accurate to a second or two. It allows for that
-  by counting plans as up to 2 seconds older than they look.
+- Closed: the brain has `POST /operations/{id}/reject` now, and a thumbs-down uses it. After a
+  reject, the plan's card can stay on the iPad screen until the page next refreshes; approving it
+  there is refused by the brain (the plan is cancelled), so nothing moves.
+- Closed: each waiting plan carries `age_s` (and `created_at`) from the brain's own clock, and the
+  loop uses it. Only for a plan without `age_s` does it read the brain's clock from the HTTP `Date`
+  header (accurate to a second or two, so plans count as up to 2 seconds older than they look).
 - `POST /operations/{id}/approve` answers only when the plan has finished moving. The loop sends it
   from a separate thread so the open palm keeps working meanwhile.
 - `POST /stop` answers "stopped" even when the brain could not reach the robot (it then also says

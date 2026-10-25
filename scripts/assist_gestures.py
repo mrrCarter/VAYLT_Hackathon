@@ -47,14 +47,14 @@ from engram.vision.assist_signals import (  # noqa: E402
 )
 
 WHO = "patient (hand signal)"   # approved_by and who, in the brain's records
+REJECTED_BY, REJECT_REASON = "hand-signal", "patient signalled no"
+CANCELLED = "cancelled"         # the brain's outcome for a rejected plan
 INTENT_ENV = ("TYPESAFE_API_KEY", "TYPESAFE_INTENT_MODEL")
 FRAME_TIMEOUT_S = 3.0
 STOP_TIMEOUT_S = 3.0
 READ_TIMEOUT_S = 3.0
 COMMAND_TIMEOUT_S = 90.0        # the brain's model planner may take a minute
 APPROVE_TIMEOUT_S = 300.0       # the brain answers an approve only when the plan has finished running
-NO_REJECT_NOTE = ("the brain has no reject endpoint: the plan stays on the iPad, but no thumbs-up will"
-                  " approve it")
 
 
 class SetupError(Exception):
@@ -142,7 +142,8 @@ class Voice:
 # The brain (engram/api.py)
 # ---------------------------------------------------------------------------
 def brain_clock(response: httpx.Response) -> float | None:
-    """The latest the brain's clock could have read when it answered, from its Date header.
+    """The latest the brain's clock could have read when it answered, from its Date header. Used
+    only for a waiting plan without the brain's own age_s.
 
     The header is whole seconds and uvicorn refreshes it about once a second, so the brain's
     clock may be up to DATE_SLACK_S ahead of it. Adding that makes a plan look, if anything,
@@ -208,6 +209,12 @@ class Brain:
     def approve(self, operation_id: str, digest: str) -> dict:
         path = f"/operations/{operation_id}/approve"
         r = self._send("POST", path, {"digest": digest, "approved_by": WHO}, timeout=APPROVE_TIMEOUT_S)
+        return self._json(r, dict, f"POST {path}")
+
+    def reject(self, operation_id: str) -> dict:
+        """The plan ends cancelled and can never be approved. 404: no such plan; 409: not waiting."""
+        path = f"/operations/{operation_id}/reject"
+        r = self._send("POST", path, {"rejected_by": REJECTED_BY, "reason": REJECT_REASON})
         return self._json(r, dict, f"POST {path}")
 
     def command(self, text: str) -> dict:
@@ -298,24 +305,35 @@ class Assist:
                 "plan_age_s": choice.age_s, "outcome": r.get("outcome"), "failure": r.get("failure")}
 
     def _cancel(self, d: Decision) -> dict:
+        """A thumbs-down. Rejects the one recent waiting plan in the brain (the same rule as a
+        thumbs-up) and only then says its line ("Okay, cancelled"). Every plan waiting now is also
+        remembered, so no thumbs-up approves it even if the reject fails; a failure says nothing."""
         if self.brain is None:
-            result = {"status": "dry_run", "note": "would remember the waiting plans so no thumbs-up approves them"}
-        else:
-            error = None
-            try:
-                pending, _ = self.brain.pending()
-            except BrainError as e:
-                pending, error = None, str(e)
-            ids = self.guard.cancel(pending, self.clock())
-            if isinstance(pending, list):
-                result = {"status": "done", "cancelled": ids, "note": NO_REJECT_NOTE}
-            else:
-                result = {"status": "done", "cancelled": [], "error": error,
-                          "warning": "could not read the waiting plans, so thumbs-up approvals are off for"
-                                     f" {self.guard.locked_until - self.clock():.0f} s"}
+            return {"status": "dry_run", "would_say": d.action.say or None,
+                    "note": f"would reject the one waiting plan if less than {APPROVE_MAX_AGE_S:.0f} s old"}
+        try:
+            pending, brain_now = self.brain.pending()
+        except BrainError as e:
+            self.guard.cancel(None, self.clock())
+            return {"status": "error", "error": str(e),
+                    "warning": "could not read the waiting plans, so thumbs-up approvals are off for"
+                               f" {self.guard.locked_until - self.clock():.0f} s"}
+        remembered = self.guard.cancel(pending, self.clock())   # the backstop, whatever the reject does
+        target, why = self.guard.to_reject(pending, brain_now)
+        if target is None:
+            return {"status": "refused", "reason": why, "remembered": remembered}
+        failed = {"status": "error", "operation_id": target.operation_id, "remembered": remembered,
+                  "note": "not rejected: no thumbs-up will approve it, and another thumbs-down tries again"}
+        try:
+            r = self.brain.reject(target.operation_id)
+        except BrainError as e:
+            return {**failed, "error": str(e)}
+        if r.get("outcome") != CANCELLED:
+            return {**failed, "error": f"the brain answered outcome {repr(r.get('outcome'))[:40]}, not {CANCELLED}"}
         if d.action.say:
             self.say(d.action.say)
-        return result
+        return {"status": "sent", "operation_id": target.operation_id, "request": target.request,
+                "plan_age_s": target.age_s, "outcome": r.get("outcome"), "already_rejected": r.get("already_rejected")}
 
     def _command(self, d: Decision) -> dict:
         if d.action.say:

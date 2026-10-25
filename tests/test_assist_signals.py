@@ -291,6 +291,48 @@ def test_a_list_that_is_not_a_list_approves_nothing():
     assert ApproveGuard().check(["ep_1"], BRAIN_NOW, 0.0)[0] is None
 
 
+def test_the_brains_age_s_comes_first():
+    guard = ApproveGuard()
+    choice, _ = guard.check([plan(age=600.0, age_s=3.0)], BRAIN_NOW, 0.0)   # proposed_at stale, age_s fresh
+    assert choice.age_s == 3.0
+    choice, why = guard.check([plan(age=5.0, age_s=75.0)], BRAIN_NOW, 0.0)   # proposed_at fresh, age_s stale
+    assert choice is None and "75 s old" in why
+    assert guard.check([plan(age=5.0, age_s=60.0)], BRAIN_NOW, 0.0)[0] is None
+    assert guard.check([plan(age=5.0, age_s=59.9)], None, 0.0)[0] is not None   # needs no Date header
+
+
+def test_only_without_age_s_does_the_date_header_stand_in():
+    guard = ApproveGuard()
+    assert guard.check([plan(age=5.0)], BRAIN_NOW, 0.0)[0].age_s == 5.0               # no age_s at all
+    assert guard.check([plan(age=5.0, age_s=None)], BRAIN_NOW, 0.0)[0].age_s == 5.0   # age_s null
+    choice, why = guard.check([plan(age=5.0)], None, 0.0)                             # neither: never
+    assert choice is None and "no age_s" in why and "Date" in why
+
+
+@pytest.mark.parametrize("bad", ["3", True, float("nan"), [3]])
+def test_an_age_s_that_is_not_a_number_is_refused_not_replaced(bad):
+    choice, why = ApproveGuard().check([plan(age=5.0, age_s=bad)], BRAIN_NOW, 0.0)   # the Date header says 5 s
+    assert choice is None and "not a number" in why
+
+
+def test_a_thumbs_down_rejects_only_the_one_recent_plan():
+    guard = ApproveGuard()
+    target, why = guard.to_reject([plan("ep_1", age_s=4.0)], BRAIN_NOW)
+    assert (target.operation_id, target.age_s, why) == ("ep_1", 4.0, "")
+    assert guard.to_reject([], BRAIN_NOW)[0] is None
+    assert guard.to_reject([plan("ep_1", age_s=1.0), plan("ep_2", age_s=2.0)], BRAIN_NOW)[0] is None
+    assert guard.to_reject([plan("ep_1", age_s=60.0)], BRAIN_NOW)[0] is None
+    assert guard.to_reject([plan("ep_1")], None)[0] is None                       # no age at all
+
+
+def test_a_reject_can_be_tried_again_and_needs_no_digest():
+    guard = ApproveGuard()
+    guard.cancel([plan("ep_1")], now=0.0)   # remembered after a reject that failed
+    guard.cancel(None, now=0.0)             # and approvals locked
+    assert guard.to_reject([plan("ep_1", age_s=2.0)], BRAIN_NOW)[0].operation_id == "ep_1"
+    assert guard.to_reject([plan("ep_1", age_s=2.0, digest=None)], BRAIN_NOW)[0] is not None
+
+
 def test_a_cancelled_plan_is_never_approved():
     guard = ApproveGuard()
     assert guard.cancel([plan("ep_1")], now=0.0) == ["ep_1"]
