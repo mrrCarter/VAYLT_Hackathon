@@ -36,10 +36,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from ..capabilities import ARM_POSES
 from ..memory import Memory
 from .base import ActionResult, RobotAdapter
 
-POSE_NAMES = {"home": "home", "reach_down": "reach", "carry": "carry"}
+# Our arm pose names -> Brian's. A plan names his own saved poses (capabilities.ARM_POSES);
+# "reach_down" is robot_agent's older name for his "reach".
+POSE_NAMES = {**{p: p for p in ARM_POSES}, "reach_down": "reach"}
 UNSENSED_OK = {"drive_bounded", "turn_bounded", "gripper_open", "gripper_close", "arm_pose"}
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..assist import COMMANDS, STEP_M, TURN_DEG
 from ..capabilities import CAPABILITIES
 
 
@@ -25,6 +26,14 @@ class Preset:
         return [{"op": op, "args": dict(args)} for op, args in self.steps]
 
 
+def _assist(request: str) -> tuple[tuple[str, tuple[tuple[str, Any], ...]], ...]:
+    """An assist command's fixed steps (engram/assist.py), in a preset's frozen form."""
+    return tuple((s["op"], tuple(s["args"].items())) for s in COMMANDS[request])
+
+
+_STEP = f"{STEP_M * 100:g} cm"
+_TURN = f"{TURN_DEG:g} degrees"
+
 PRESETS: dict[str, Preset] = {
     p.name: p
     for p in [
@@ -34,6 +43,21 @@ PRESETS: dict[str, Preset] = {
                "Close the robot's gripper (also called the claw, hand or grip)."),
         Preset("look_around", "Look around", (("observe", ()),),
                "Look around with the camera and update what the robot knows about where things are."),
+        # ENGRAM Assist (engram/assist.py): the same canonical requests and steps the engine plans.
+        Preset("move_forward", "Move forward", _assist("Move forward"),
+               f"Drive the robot straight forward one short step ({_STEP}). Only when no distance is said."),
+        Preset("move_back", "Move back", _assist("Move back"),
+               f"Drive the robot straight backward one short step ({_STEP}), also called back up. "
+               "Only when no distance is said."),
+        Preset("turn_left", "Turn left", _assist("Turn left"),
+               f"Turn the robot in place to the left by {_TURN}. Only when no angle is said."),
+        Preset("turn_right", "Turn right", _assist("Turn right"),
+               f"Turn the robot in place to the right by {_TURN}. Only when no angle is said."),
+        Preset("pick_up", "Pick it up", _assist("Pick it up"),
+               "Pick up whatever is in front of the claw: lower the arm, close the claw and lift it. "
+               "Not for fetching or bringing a named object."),
+        Preset("put_down", "Put it down", _assist("Put it down"),
+               "Put down what the claw is holding: lower the arm, open the claw and lift the arm again."),
     ]
 }
 

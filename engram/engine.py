@@ -14,8 +14,9 @@ import json
 import re
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .checker import check_plan
 from .db import now
@@ -32,6 +33,7 @@ from .skills import Skills
 from .teach import extract_rules
 
 APPROVAL_TTL_S = 120.0
+CANCELLED = "cancelled"   # episode outcome of a plan a person rejected (POST /operations/{id}/reject)
 # A stop word anywhere in a command stops the robot ("Stop.", "STOP!", "Please stop.", "Wait!", "Hold on.",
 # "Stop. Bring ..."). whisper.cpp writes "Stop."; without this it reached the planner and was refused as an
 # unknown object. Deliberately broad ("don't stop the timer" stops too, and so does "Remember to wait for the
@@ -41,10 +43,20 @@ APPROVAL_TTL_S = 120.0
 # stop. The same pattern as STOP_WORDS in console/server/parser.py (tests/test_spoken_stop.py checks it).
 STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa|wait|pause|hold\s+on|hold\s+it|hang\s+on)\b",
                         re.IGNORECASE)
+# request -> its fixed steps, a reason to refuse it, or None when the parser does not know it
+RequestParser = Callable[[str], "list[dict[str, Any]] | str | None"]
 
 
 class EngineError(Exception):
     pass
+
+
+class OperationNotFound(EngineError):
+    """No operation has this id."""
+
+
+def _iso_utc(t: float) -> str:
+    return datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 class Engine:
@@ -63,6 +75,8 @@ class Engine:
         self.model_hashes_at_start = hash_models(models_dir)
         # Canonical request text (normalized) -> fixed steps. See register_fixed_request().
         self.fixed_requests: dict[str, list[dict[str, Any]]] = {}
+        # Families of fixed requests ("Move forward 30 centimeters"). See register_request_parser().
+        self.request_parsers: list[RequestParser] = []
 
     # ---- setup -----------------------------------------------------------
 
@@ -80,10 +94,41 @@ class Engine:
         """
         self.fixed_requests[normalize(request)] = copy.deepcopy(steps)
 
+    def register_request_parser(self, parse: RequestParser) -> None:
+        """Plan every request parse() recognizes as the steps it returns, without a planner.
+
+        For a family of wordings that register_fixed_request cannot list one by one, such as
+        "Turn left 90 degrees". parse(request) returns the steps, a reason to refuse a request it
+        recognizes but will not plan (a distance past a bound), or None for any other request.
+        Exact fixed requests are looked up first. The rest is as for register_fixed_request:
+        propose() still refuses negated or future wording, the checker must accept the steps, and a
+        person must approve the plan's digest before anything runs.
+        """
+        if parse not in self.request_parsers:
+            self.request_parsers.append(parse)
+
+    def _fixed_steps(self, request: str) -> list[dict[str, Any]] | str | None:
+        """This request's fixed steps, a reason to refuse it, or None when it is not a fixed request."""
+        steps = self.fixed_requests.get(normalize(request))
+        if steps is not None:
+            return steps
+        for parse in self.request_parsers:
+            out = parse(request)
+            if out is not None:
+                return out
+        return None
+
     def load_arena(self, arena: dict[str, Any]) -> None:
-        """Bind tagged objects from the arena file. Locations come only from observations."""
+        """Bind tagged objects from the arena file. Locations come only from observations.
+
+        Other names come from the same file: an object's "aliases" ("pills") and "zone_aliases"
+        ({"patient": ["me", ...]}), so "Bring me my pills" finds the pill bottle and the patient.
+        """
         for o in arena["objects"]:
             self.memory.bind_object(o["id"], o["name"], o["tag"], o.get("graspable", True), o.get("width_mm"))
+            self.memory.object_aliases[o["id"]] = tuple(a.lower() for a in o.get("aliases", ()))
+        for zone, names in arena.get("zone_aliases", {}).items():
+            self.memory.zone_aliases.update({a.lower(): zone for a in names})
 
     def overhead_scan(self) -> int:
         """What the overhead camera would report. With the mock robot we ask it for visible tags."""
@@ -140,10 +185,12 @@ class Engine:
 
         bundle = self.memory.retrieve_memory_bundle(request, self.skills.approved_names())
         targets = targets_in(request, self.memory)
-        zone = find_zone(request, self.zones)
-        fixed = self.fixed_requests.get(normalize(request))
+        zone = find_zone(request, self.zones, self.memory.zone_aliases)
+        fixed = self._fixed_steps(request)
         skill = self.skills.find(targets, zone) if targets and fixed is None else None
-        if fixed is not None:
+        if isinstance(fixed, str):   # a fixed request it recognized but will not plan, e.g. past a bound
+            res = PlanResult(None, refused=fixed)
+        elif fixed is not None:
             plan = {"goal": request, "steps": copy.deepcopy(fixed), "evidence": [], "rules_used": []}
             res = PlanResult(plan, planner_calls=0, source="fixed", targets=targets, zone=None)
         elif skill:
@@ -220,6 +267,12 @@ class Engine:
         plan = json.loads(ep["plan_json"])
         if approved_digest != digest(plan):
             raise EngineError("digest does not match the proposed plan")
+        # Take the plan out of 'proposed' in one statement, so a second approval or a rejection racing this one
+        # cannot take it too: whoever is first wins, the other gets an error, and nothing runs twice.
+        if self.conn.execute("UPDATE episode SET outcome = 'running' WHERE id = ? AND outcome = 'proposed'",
+                             (operation_id,)).rowcount != 1:
+            self.conn.commit()
+            raise EngineError("operation is no longer waiting for approval")
         t = now()
         self.conn.execute(
             "INSERT INTO approval(id, target_kind, target_id, digest, approved_by, approved_at, expires_at, used_at) "
@@ -231,12 +284,41 @@ class Engine:
         if not check.ok:
             self._finish(operation_id, "rejected", "; ".join(check.errors))
             return {"operation_id": operation_id, "outcome": "rejected", "check": check.to_dict()}
-        self.conn.execute("UPDATE episode SET outcome = 'running' WHERE id = ?", (operation_id,))
         self.conn.commit()
         result = self.executor.run(operation_id, plan)
         self._finish(operation_id, result.outcome, result.failure)
         return {"operation_id": operation_id, "outcome": result.outcome, "failure": result.failure,
                 "steps": result.steps}
+
+    def reject(self, operation_id: str, rejected_by: str, reason: str = "") -> dict[str, Any]:
+        """A person declines a plan waiting for approval (a thumbs-down). It can never be approved afterwards.
+
+        The plan ends 'cancelled' with who and why, and leaves pending(). The operation journal
+        (GET /events), where approved plans record their steps, gets a 'reject' row with the plan's
+        digest. Rejecting it again returns the same answer. An unknown id raises OperationNotFound;
+        a plan that is not waiting (running, finished, refused, or rejected by the checker) raises
+        EngineError.
+        """
+        if not rejected_by:
+            raise EngineError("a person must reject")
+        ep = self.conn.execute("SELECT outcome, failure, plan_json FROM episode WHERE id = ?", (operation_id,)).fetchone()
+        if not ep:
+            raise OperationNotFound(f"no operation {operation_id}")
+        failure = f"rejected by {rejected_by}" + (f": {reason}" if reason else "")
+        # One statement, like the approval's: an approval racing this rejection cannot also take the plan.
+        taken = self.conn.execute(
+            "UPDATE episode SET outcome = ?, failure = ?, finished_at = ? WHERE id = ? AND outcome = 'proposed'",
+            (CANCELLED, failure, now(), operation_id)).rowcount == 1
+        if taken:   # the journal row commits together with the outcome
+            self.executor.journal(new_id("op"), operation_id, "reject",
+                                  {"rejected_by": rejected_by, "digest": digest(json.loads(ep["plan_json"]))},
+                                  "rejected", failure)
+            return {"operation_id": operation_id, "outcome": CANCELLED, "failure": failure, "already_rejected": False}
+        self.conn.commit()
+        ep = self.conn.execute("SELECT outcome, failure FROM episode WHERE id = ?", (operation_id,)).fetchone()
+        if ep["outcome"] == CANCELLED:
+            return {"operation_id": operation_id, "outcome": CANCELLED, "failure": ep["failure"], "already_rejected": True}
+        raise EngineError(f"operation is {ep['outcome']}, not waiting for approval")
 
     def _finish(self, episode_id: str, outcome: str, failure: str | None) -> None:
         self.conn.execute("UPDATE episode SET outcome = ?, failure = ?, finished_at = ? WHERE id = ?",
@@ -269,18 +351,22 @@ class Engine:
 
         Lets the iPad show plans it did not ask for itself: a gesture's "return to rest",
         or a future task whose trigger fired. Only recent ones, so old unapproved
-        proposals (for example from a test run) do not pile up on screen.
+        proposals (for example from a test run) do not pile up on screen. created_at is
+        when it was proposed by this server's clock (ISO 8601, UTC) and age_s how long ago
+        that was by the same clock, so a client on another machine needs no clock of its own.
         """
+        t = now()
         rows = self.conn.execute(
             "SELECT id, request, plan_json, evidence_json, started_at FROM episode "
             "WHERE outcome = 'proposed' AND started_at >= ? ORDER BY started_at DESC",
-            (now() - max_age_s,),
+            (t - max_age_s,),
         ).fetchall()
         out = []
         for r in rows:
             meta = json.loads(r["evidence_json"] or "{}")
             out.append({"operation_id": r["id"], "request": r["request"], "plan": json.loads(r["plan_json"]),
-                        "digest": meta.get("digest"), "source": meta.get("source"), "planner_note": meta.get("planner_note", ""), "proposed_at": r["started_at"]})
+                        "digest": meta.get("digest"), "source": meta.get("source"), "planner_note": meta.get("planner_note", ""), "proposed_at": r["started_at"],
+                        "created_at": _iso_utc(r["started_at"]), "age_s": round(t - r["started_at"], 3)})
         return out
 
     def events(self, limit: int = 200) -> list[dict[str, Any]]:

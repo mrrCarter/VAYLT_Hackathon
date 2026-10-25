@@ -6,7 +6,7 @@ keeping track of what the robot would be holding, and rejects:
 - actions that are not on the allow list
 - missing, extra, or wrongly typed arguments
 - motion past the hard bounds
-- unknown objects or zones
+- unknown objects, zones or arm poses
 - picking an object whose location is stale, unless the plan looks first
 - breaking an "X must come before Y" rule that memory learned from a source
 """
@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .capabilities import CAPABILITIES, MAX_STEPS, MAX_TEXT
+from .capabilities import ARM_POSES, CAPABILITIES, MAX_STEPS, MAX_TEXT
 from .memory import Memory
 
 
@@ -97,6 +97,10 @@ def check_plan(plan: Any, memory: Memory, zones: set[str], at: float | None = No
         zone = args.get("zone")
         if zone is not None and zone not in zones:
             res.errors.append(f"{where}: unknown zone '{zone}'")
+            continue
+        pose = args.get("pose")
+        if pose is not None and pose not in ARM_POSES:
+            res.errors.append(f"{where}: unknown arm pose '{pose}' (known: {', '.join(sorted(ARM_POSES))})")
             continue
 
         if op == "locate_tag":
