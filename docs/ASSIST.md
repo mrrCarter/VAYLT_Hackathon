@@ -34,7 +34,9 @@ a box or post by the sofa, facing the room).
 3. **Switch to the real robot:** wheels lifted for the first tries, one person's hand on the motor power.
    `bash ~/engram_hub/scripts/cds_up.sh --real`. The status must say `plans + memory (real robot)`.
    Say "Stop." first and check the robot reports stopped; clear it on the iPad. Then "Move forward",
-   "Turn left", "Pick it up", "Put it down", each approved by holding Approve.
+   "Turn left", "Pick it up", "Put it down", each approved by holding Approve. Memory carries over from
+   the pretend robot (same memory file), so "Where are my pills?" can answer from your rehearsal until the
+   robot's camera sees the bottle again; the fetch itself always looks with the camera.
 
 4. **Hand signals (laptop next to the robot):** see "Hand signals" below. It reads the robot's camera at
    `http://star-pi.local:8200` and sends to the brain at `http://star-pi.local:8001`. The intent model needs
